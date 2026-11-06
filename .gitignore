@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+.DS_Store
+# local ontology stores and demo databases
+*.sqlite
+*.db
+.env

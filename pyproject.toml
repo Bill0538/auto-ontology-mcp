@@ -1,0 +1,46 @@
+[project]
+name = "auto-ontology-mcp"
+version = "0.3.0"
+description = "NVIDIA Auto Ontology's semantic layer and a personal knowledge base as an MCP server for Claude, ChatGPT and other MCP clients. The client model is the LLM; no model API key needed."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+authors = [
+    { name = "gogoymh", email = "12ymh12@gmail.com" }
+]
+requires-python = ">=3.12"
+keywords = ["mcp", "ontology", "semantic-layer", "text-to-sql", "claude", "chatgpt"]
+dependencies = [
+    "fastmcp>=4.1,<5",
+    "pyyaml>=6",
+    "sqlalchemy>=2.0,<3",
+    "sqlglot>=30,<31",
+]
+
+[project.optional-dependencies]
+postgres = ["psycopg[binary]>=3.2"]
+mysql = ["pymysql>=1.1"]
+duckdb = ["duckdb-engine>=0.15"]
+all = ["psycopg[binary]>=3.2", "pymysql>=1.1", "duckdb-engine>=0.15"]
+
+[project.scripts]
+auto-ontology-mcp = "auto_ontology_mcp.__main__:main"
+
+[project.urls]
+Repository = "https://github.com/gogoymh/auto-ontology-mcp"
+Upstream = "https://github.com/NVIDIA/auto-ontology"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

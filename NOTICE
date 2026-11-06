@@ -1,0 +1,29 @@
+auto-ontology-mcp
+Copyright 2026 gogoymh
+
+This project is a derivative work of NVIDIA Auto Ontology
+(https://github.com/NVIDIA/auto-ontology),
+Copyright (c) 2024-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+The following parts are adapted from Auto Ontology source files:
+- Modeling, relationship, SQL attribute, entity extraction, SQL writing and
+  answer validation rules (src/auto_ontology_mcp/guidance.py), from
+  auto_ontology/semantic/term_extractor.py, semantic/fk_suggester.py,
+  semantic/semantic_fk.py, semantic/sql_attribute_suggester.py,
+  retrieval/entity_coverage/prompts.py, retrieval/text_to_sql/prompts.py and
+  skills/nvidia-ontology-query/references/query-validation.md.
+- Column profiling and date format inference (src/auto_ontology_mcp/profiling.py),
+  from semantic/visit_enter.py and semantic/date_format.py.
+- Expression mining for SQL attribute suggestions
+  (src/auto_ontology_mcp/sqlcheck.py: extract_expressions), from
+  semantic/sql_attribute_suggester.py.
+- Literal and join probes (src/auto_ontology_mcp/validation.py), following
+  retrieval/text_to_sql/db_probe/literal_check.py and join_path_check.py.
+
+Changes: the LLM, embedding and reranking calls were removed. The MCP client's
+model performs those steps through the tools, and the server keeps the
+deterministic parts (catalog extraction, profiling, key inference, validation
+and read-only execution) on a local SQLite store instead of Postgres/pgvector.
+
+This project is not affiliated with or endorsed by NVIDIA.
