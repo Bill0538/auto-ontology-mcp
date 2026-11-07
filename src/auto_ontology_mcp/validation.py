@@ -418,7 +418,7 @@ class Validator:
         unmodeled = []
         for p in analysis.columns:
             col = self._col(p)
-            if not col:
+            if not col or col.get("pseudo"):
                 continue
             attrs = self.attr_by_column.get(col["id"], [])
             if not attrs and col["id"] not in self.rel_columns and not col["name"].startswith("_"):

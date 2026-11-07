@@ -41,6 +41,9 @@ def _default_schemas(inspector: sa.Inspector, backend: str) -> list[str | None]:
     return keep or [None]
 
 
+SQLITE_SHADOW_SUFFIXES = ("_data", "_idx", "_content", "_docsize", "_config")
+
+
 class Scanner:
     def __init__(self, store: Store, connections: Connections, sample_rows: int) -> None:
         self.store = store
@@ -73,6 +76,17 @@ class Scanner:
         warnings: list[str] = []
 
         extracted: list[dict[str, Any]] = []
+        shadow: set[str] = set()
+        if backend == "sqlite":
+            # FTS5 and other virtual tables keep their data in shadow tables (x_data, x_idx, ...); skip those.
+            try:
+                with engine.connect() as conn:
+                    virtual = [r[0] for r in conn.exec_driver_sql(
+                        "SELECT name FROM sqlite_master WHERE type = 'table' AND sql LIKE 'CREATE VIRTUAL TABLE%'"
+                    )]
+                shadow = {f"{v}{suffix}" for v in virtual for suffix in SQLITE_SHADOW_SUFFIXES}
+            except Exception:  # noqa: BLE001
+                shadow = set()
         for schema in schema_list:
             try:
                 names = [(n, "table") for n in inspector.get_table_names(schema=schema)]
@@ -81,7 +95,7 @@ class Scanner:
                 warnings.append(f"Could not list tables in schema {schema!r}: {short_error(exc)}")
                 continue
             for name, kind in names:
-                if backend == "sqlite" and name.startswith("sqlite_"):
+                if backend == "sqlite" and (name.startswith("sqlite_") or name in shadow):
                     continue
                 try:
                     cols = inspector.get_columns(name, schema=schema)

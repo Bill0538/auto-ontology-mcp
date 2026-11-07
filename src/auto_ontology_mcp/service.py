@@ -20,7 +20,7 @@ from .datasources import Connections, mask_url, normalize_url, short_error, sqlg
 from .errors import KnowledgeError, OntologyError  # noqa: F401 (re-exported)
 from .graph import JoinGraph
 from .inference import names_own_table
-from .knowledge import KNOWLEDGE_DS, SOURCES_TABLE, Knowledge
+from .knowledge import KNOWLEDGE_DS, SOURCES_TABLE, Knowledge, is_builtin
 from .naming import clean_label, compact, id_base, to_label
 from .profiling import is_numeric_type
 from .search import build_docs, search
@@ -926,6 +926,8 @@ class OntologyService:
     ) -> dict[str, Any]:
         ds = self.ds(datasource)
         t = self.term_ref(ds, term)
+        if self.knowledge.is_knowledge(ds) and is_builtin(t):
+            raise OntologyError(f"{t['name']} is built into the knowledge store and cannot be changed.")
         if delete:
             if t.get("spec"):
                 raise OntologyError(f"{t['name']} stores records; delete it with define_entity(name, delete=true).")
@@ -1034,12 +1036,19 @@ class OntologyService:
         if (kinds is None and self.knowledge.is_knowledge(ds)) or (kinds and "value" in kinds):
             for v in self._value_hits(ds, query, [40]):
                 hits.append({"kind": "value", "term": v["term"], "attribute": v["attribute"], "column": v["column"], "values": v["values"]})
-        return {
-            "datasource": ds["name"],
-            "query": query,
-            "hits": hits,
-            "hint": None if hits else "Nothing matched lexically. Try the schema's own words, a synonym, singular/plural, or translate the phrase.",
-        }
+        out: dict[str, Any] = {"datasource": ds["name"], "query": query, "hits": hits}
+        if kinds is None and self.knowledge.is_knowledge(ds):
+            try:
+                text = self.knowledge.search_text(query, limit=5)
+            except KnowledgeError:
+                text = {"hits": []}
+            if text["hits"]:
+                out["text_hits"] = text["hits"]
+                out["text_hint"] = "Passages, bodies and sources that mention these words; search_text returns more, with filters."
+        out["hint"] = None if hits or out.get("text_hits") else (
+            "Nothing matched lexically. Try the schema's own words, a synonym, singular/plural, or translate the phrase."
+        )
+        return out
 
     def get_term(self, term: str, datasource: str | None = None, brief: bool = False) -> dict[str, Any]:
         ds = self.ds(datasource)
@@ -1117,8 +1126,12 @@ class OntologyService:
             rel_counts[r["source_term_id"]] += 1
             rel_counts[r["target_term_id"]] += 1
         rows = []
+        built_in = []
         for t in terms:
             tkind = t.get("kind") or "entity"
+            if self.knowledge.is_knowledge(ds) and is_builtin(t):
+                built_in.append(f"{t['name']} ({t['table_name']})" if t.get("table_name") else t["name"])
+                continue
             if kind != "all" and tkind != kind:
                 continue
             if status and t["status"] != status:
@@ -1141,7 +1154,11 @@ class OntologyService:
                 item["empty"] = True
             rows.append(item)
         page = rows[offset: offset + max(1, min(limit, 500))]
-        return {"datasource": ds["name"], "total": len(rows), "offset": offset, "terms": page}
+        out = {"datasource": ds["name"], "total": len(rows), "offset": offset, "terms": page}
+        if built_in:
+            out["built_in_tables"] = built_in
+            out["built_in_note"] = "Tables the store keeps for you (sources, passages, the Term mirror and search indexes); query them with SQL."
+        return out
 
     def recent_changes(self, limit: int = 30) -> dict[str, Any]:
         """What was added or changed lately, newest first, like an LLM Wiki's log.md."""
@@ -1174,7 +1191,12 @@ class OntologyService:
         if datasource is None and self.knowledge.ds(create=False) is not None:
             datasource = KNOWLEDGE_DS
         ds = self.ds(datasource)
-        target = Path(directory).expanduser() if directory else self.settings.home / "wiki" / ds["name"]
+        if self.knowledge.is_knowledge(ds):
+            self.knowledge.index.sync()
+            default = self.knowledge.wiki_dir
+        else:
+            default = self.settings.home / "wiki" / ds["name"]
+        target = Path(directory).expanduser() if directory else default
         return export_wiki(self, ds, target)
 
     def describe_table(self, table: str, datasource: str | None = None) -> dict[str, Any]:
@@ -1379,6 +1401,8 @@ class OntologyService:
 
     def get_query_context(self, terms: list[str], question: str | None = None, datasource: str | None = None) -> dict[str, Any]:
         ds = self.ds(datasource)
+        if self.knowledge.is_knowledge(ds):
+            self.knowledge.index.sync()
         dialect = self.dialect(ds)
         resolved, unresolved = [], []
         for ref in terms:
@@ -1473,9 +1497,12 @@ class OntologyService:
         }
 
     def _validator(self, ds: dict[str, Any]) -> Validator:
+        columns = self.store.columns_for_datasource(ds["id"])
+        if self.knowledge.is_knowledge(ds):
+            columns = columns + self.knowledge.index.pseudo_columns(columns)
         return Validator(
             dialect=self.dialect(ds),
-            catalog_columns=self.store.columns_for_datasource(ds["id"]),
+            catalog_columns=columns,
             relationships=self.store.relationships(ds["id"], ("accepted", "proposed", "rejected")),
             attributes=self.store.attributes_for_datasource(ds["id"]),
             sql_attributes=self.store.sql_attributes_for_datasource(ds["id"]),
@@ -1484,6 +1511,8 @@ class OntologyService:
 
     def validate_sql(self, sql: str, datasource: str | None = None) -> dict[str, Any]:
         ds = self.ds(datasource)
+        if self.knowledge.is_knowledge(ds):
+            self.knowledge.index.sync()
         result = self._validator(ds).validate(sql, probe=True)
         result["datasource"] = ds["name"]
         result["dialect"] = self.dialect(ds)
@@ -1497,6 +1526,8 @@ class OntologyService:
 
     def run_sql(self, sql: str, question: str | None = None, max_rows: int = 100, datasource: str | None = None) -> dict[str, Any]:
         ds = self.ds(datasource)
+        if self.knowledge.is_knowledge(ds):
+            self.knowledge.index.sync()
         dialect = self.dialect(ds)
         try:
             guard_sources(guard_readonly(sql, dialect), self._catalog_tables(ds))
@@ -1732,6 +1763,9 @@ class OntologyService:
                 lines.append(f"- {r['records']} {r['entity']} record(s): ids {r['ids'][:20]}")
             for c in data["concepts"]:
                 lines.append(f"- concept {c['name']}" + (f" ({c['locator']})" if c.get("locator") else ""))
+            for p in data.get("passages") or []:
+                where = ", ".join(x for x in (p.get("heading"), p.get("locator")) if x)
+                lines.append(f"- passage {p['id']} ({p['kind']}{', ' + where if where else ''}): {p['text'][:300]}")
             return {"id": doc_id, "title": src["title"], "text": "\n".join(lines), "url": src.get("uri") or f"ontology://knowledge/source/{rid}", "metadata": {"kind": src.get("kind")}}
         for ds in self.store.datasources():
             if kind == "term" and self.store.one("SELECT id FROM term WHERE id = ? AND datasource_id = ?", (rid, ds["id"])):

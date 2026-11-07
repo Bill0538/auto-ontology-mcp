@@ -48,6 +48,9 @@ class Settings:
     host: str
     port: int
 
+    vault: Path | None = None
+    """Obsidian vault for originals (AUTO_ONTOLOGY_VAULT). Unset: the knowledge export folder is the vault."""
+
     @classmethod
     def from_env(cls) -> "Settings":
         home = Path(os.environ.get("AUTO_ONTOLOGY_HOME", "~/.auto-ontology-mcp")).expanduser()
@@ -62,4 +65,5 @@ class Settings:
             token=os.environ.get("AUTO_ONTOLOGY_MCP_TOKEN") or None,
             host=os.environ.get("AUTO_ONTOLOGY_MCP_HOST", "127.0.0.1"),
             port=_int("AUTO_ONTOLOGY_MCP_PORT", 8765),
+            vault=Path(os.environ["AUTO_ONTOLOGY_VAULT"]).expanduser() if os.environ.get("AUTO_ONTOLOGY_VAULT") else None,
         )

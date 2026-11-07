@@ -40,12 +40,20 @@ documents, images, notes or facts to remember, read them yourself and store what
 search_ontology first and reuse existing Terms instead of creating near-duplicates. Facts you \
 would count, sum, filter or compare go into entities (define_entity, then add_records with a \
 source); explanations, ideas and definitions go into concepts (save_concept) linked by typed \
-relations. Every record and concept should name its source. Ask before deleting anything. \
-list_terms is the index and recent_changes the log. For "what is X / what do I know about X", \
-answer from get_term (definition, body, relations, sources); for totals, counts and comparisons, \
-use SQL as for any datasource. Cite sources (get_source, or join _source_id = sources.id). When an \
-answer is worth keeping, file it back: append it to a concept's body or save_example_query. \
-export_wiki writes the store as an Obsidian vault the user can browse.
+relations. Documents (articles, papers, meeting notes) keep their full text as the original in \
+the Obsidian vault (source.original for a note already there, original_text or original_file to \
+save one); the store keeps their summaries and excerpts as passages (save_passages), each with \
+its heading or locator and the Terms it is about. Every record, concept and passage should name \
+its source. Ask before deleting anything. list_terms is the index and recent_changes the log. For \
+"what is X / what do I know about X", answer from get_term (definition, body, relations, sources) \
+and search_text (passages); for totals, counts and comparisons, use SQL as for any datasource. \
+SQL also reads the concept graph and the text: terms, term_relations (walk chains with WITH \
+RECURSIVE), term_sources, passages, passage_terms, and the full-text indexes passages_fts, \
+terms_fts and sources_fts (MATCH '"word"*', ORDER BY bm25(...)), so one query can combine a text \
+search with relations and records. Cite sources (get_source, or join _source_id = sources.id) and \
+give the [[link]] to the original. When an answer is worth keeping, file it back: append it to a \
+concept's body or save_example_query. export_wiki writes the store as Obsidian pages next to the \
+originals.
 
 Search is lexical, not semantic. Search with the words the schema uses; if the user writes in \
 another language, translate entity phrases to the ontology's language first, and try synonyms. \
@@ -171,6 +179,10 @@ depends_on, causes, used_for, contrasts_with, same_as, example_of. A Term can be
 with records and a body that explains it.
 4. Provenance on everything: pass source={title, kind, uri, ...} (or a source id) and, per record, \
 _locator (page, timestamp, line) and _evidence (the quote or number as written).
-5. Never invent values. Leave unknown fields out; record ambiguity in _note.
-6. Certified means a person confirmed it. New knowledge is draft; do not certify on your own.
+5. Documents: the full text belongs in the Obsidian vault as the source's original (original, \
+original_text or original_file), not in the store. Save what is worth finding again as passages: \
+one idea each, quotes as written or summaries of one section, with the heading or locator and the \
+Terms they are about.
+6. Never invent values. Leave unknown fields out; record ambiguity in _note.
+7. Certified means a person confirmed it. New knowledge is draft; do not certify on your own.
 """

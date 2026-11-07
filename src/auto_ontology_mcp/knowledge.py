@@ -25,9 +25,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterator
 
+from . import vault
 from .errors import KnowledgeError
 from .naming import clean_label, to_label
 from .store import new_id, now
+from .textindex import INDEX_TABLES, TextIndex
 
 if TYPE_CHECKING:  # pragma: no cover
     from .service import OntologyService
@@ -58,10 +60,11 @@ CREATE TABLE IF NOT EXISTS {SOURCES_TABLE} (
     published_on TEXT,
     captured_at TEXT NOT NULL,
     summary TEXT,
-    content TEXT
+    content TEXT,
+    original TEXT
 )
 """
-SOURCE_FIELDS = ("title", "kind", "uri", "author", "published_on", "summary", "content")
+SOURCE_FIELDS = ("title", "kind", "uri", "author", "published_on", "summary", "content", "original")
 SOURCE_SPEC = {
     "table": SOURCES_TABLE,
     "columns": [
@@ -73,10 +76,21 @@ SOURCE_SPEC = {
         {"name": "captured_at", "type": "datetime", "display_name": "Captured At"},
         {"name": "summary", "type": "text", "display_name": "Summary"},
         {"name": "content", "type": "text", "display_name": "Content", "description": "Transcribed text or excerpt"},
+        {"name": "original", "type": "text", "display_name": "Original in Obsidian",
+         "description": "Vault-relative path of the full original in the Obsidian vault; link it as [[path]]"},
     ],
     "keys": [],
     "label": "title",
+    "builtin": True,
 }
+SOURCE_DESCRIPTION = "A document, image, web page, note or conversation that knowledge was taken from."
+RESERVED_TABLES = frozenset({SOURCES_TABLE, *INDEX_TABLES})
+
+
+def is_builtin(term: dict[str, Any] | None) -> bool:
+    """Sources, passages, the Term mirror and the search indexes: tables the server owns."""
+    spec = (term or {}).get("spec") or {}
+    return bool(spec.get("builtin")) or spec.get("table") in RESERVED_TABLES
 
 
 def to_ident(name: str) -> str:
@@ -171,14 +185,31 @@ class Knowledge:
         self.svc = svc
         self.store = svc.store
         self.path: Path = svc.settings.home / "knowledge.sqlite"
+        self.index = TextIndex(self)
+
+    # --------------------------------------------------------------- vault
+    @property
+    def vault_root(self) -> Path:
+        """The Obsidian vault that holds originals; the export folder unless AUTO_ONTOLOGY_VAULT is set."""
+        return (self.svc.settings.vault or self.svc.settings.home / "wiki" / KNOWLEDGE_DS).expanduser()
+
+    @property
+    def wiki_dir(self) -> Path:
+        """Where export_wiki writes the knowledge store: the vault itself, or a subfolder of the user's own vault."""
+        return self.vault_root if self.svc.settings.vault is None else self.vault_root / "auto-ontology"
+
+    @property
+    def originals_dir(self) -> Path:
+        return self.wiki_dir / "originals"
 
     # ------------------------------------------------------------ plumbing
     @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
+    def _write(self, foreign_keys: bool = True) -> Iterator[sqlite3.Connection]:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
-        con.execute("PRAGMA foreign_keys = ON")
+        if foreign_keys:
+            con.execute("PRAGMA foreign_keys = ON")
         try:
             yield con
             con.commit()
@@ -190,6 +221,8 @@ class Knowledge:
 
     def ds(self, create: bool = True) -> dict[str, Any] | None:
         ds = self.store.datasource_by_name(KNOWLEDGE_DS)
+        if ds and self.path.exists():
+            self.index.ensure_schema(ds)
         if ds or not create:
             return ds
         with self._write() as con:
@@ -204,8 +237,12 @@ class Knowledge:
         }
         self.store.insert("datasource", ds)
         self._refresh(ds)
-        self._ensure_term(ds, "Source", "A document, image, web page, note or conversation that knowledge was taken from.", SOURCE_SPEC)
+        self._ensure_source_term(ds)
+        self.index.ensure_schema(ds)
         return self.store.datasource_by_name(KNOWLEDGE_DS)
+
+    def _ensure_source_term(self, ds: dict[str, Any]) -> dict[str, Any]:
+        return self._ensure_term(ds, "Source", SOURCE_DESCRIPTION, SOURCE_SPEC)
 
     def is_knowledge(self, ds: dict[str, Any]) -> bool:
         return ds.get("name") == KNOWLEDGE_DS
@@ -234,9 +271,11 @@ class Knowledge:
     def entity(self, ds: dict[str, Any], ref: str) -> dict[str, Any]:
         t = self._find_term(ds, ref)
         if t is None or not t.get("spec"):
-            names = [x["name"] for x in self.store.terms(ds["id"]) if x.get("spec")]
+            names = [x["name"] for x in self.store.terms(ds["id"]) if x.get("spec") and not is_builtin(x)]
             hint = f" Entities: {', '.join(names)}." if names else ""
             raise KnowledgeError(f"{ref!r} is not a knowledge entity. Create it with define_entity first.{hint}")
+        if is_builtin(t):
+            raise KnowledgeError(_builtin_message(t))
         return t
 
     def _ensure_term(self, ds: dict[str, Any], name: str, description: str, spec: dict[str, Any]) -> dict[str, Any]:
@@ -300,8 +339,8 @@ class Knowledge:
         existing = self._find_term(ds, label)
         if delete:
             return self._delete_entity(ds, existing, label, force)
-        if existing is not None and existing["name"] == "Source" and existing.get("spec", {}).get("table") == SOURCES_TABLE:
-            raise KnowledgeError("Source is built in; describe sources through the source parameter of the write tools.")
+        if is_builtin(existing):
+            raise KnowledgeError(_builtin_message(existing))
 
         spec = dict(existing["spec"]) if existing and existing.get("spec") else None
         if spec:
@@ -312,8 +351,8 @@ class Knowledge:
                 raise KnowledgeError(f"table must be snake_case ASCII (got {table!r}; try {to_ident(table)!r}).")
             if not table_name or not _IDENT.match(table_name):
                 raise KnowledgeError(f"Pass table=<snake_case English name> for {label!r}, e.g. table='receipts'.")
-            if table_name in (SOURCES_TABLE,) or table_name.startswith("sqlite_"):
-                raise KnowledgeError(f"Table name {table_name!r} is reserved.")
+            if table_name in RESERVED_TABLES or table_name.startswith("sqlite_") or table_name.endswith("_fts"):
+                raise KnowledgeError(f"Table name {table_name!r} is reserved; pass another table name.")
             clash = self._find_term(ds, label)
             if clash is None and any(t["name"] == table_name for t in self.store.tables(ds["id"])):
                 raise KnowledgeError(f"A table named {table_name!r} already exists; pass another table name.")
@@ -403,6 +442,7 @@ class Knowledge:
             self.store.update("term", tid, values)
         self._sync_attributes(ds, tid, label, new_spec)
         self.store.log("knowledge_entity", tid, "define", {"table": table_name, "added": [c["name"] for c in added]})
+        self.index.sync()
         return {
             "entity": label,
             "table": table_name,
@@ -485,8 +525,8 @@ class Knowledge:
     def _delete_entity(self, ds: dict[str, Any], term: dict[str, Any] | None, label: str, force: bool) -> dict[str, Any]:
         if term is None or not term.get("spec"):
             raise KnowledgeError(f"No knowledge entity named {label!r}.")
-        if term["spec"]["table"] == SOURCES_TABLE:
-            raise KnowledgeError("The Source entity cannot be deleted.")
+        if is_builtin(term):
+            raise KnowledgeError(_builtin_message(term))
         table = term["spec"]["table"]
         rows = self._count(table)
         if rows and not force:
@@ -503,6 +543,7 @@ class Knowledge:
             con.execute("DELETE FROM term WHERE id = ?", (term["id"],))
         self._refresh(ds)
         self.store.log("knowledge_entity", term["id"], "delete", {"table": table, "records": rows})
+        self.index.sync()
         return {"deleted": term["name"], "records_deleted": rows}
 
     # ------------------------------------------------------------- sources
@@ -519,13 +560,25 @@ class Knowledge:
         if not isinstance(source, dict):
             raise KnowledgeError("source must be an id or an object with a title")
         if source.get("id") is not None:
-            return self._source_id(con, source["id"])
+            sid = self._source_id(con, source["id"])
+            if source.get("original"):
+                path = vault.link_existing(self.vault_root, str(source["original"]))
+                con.execute(f"UPDATE {SOURCES_TABLE} SET original = ? WHERE id = ?", (path, sid))
+            self._store_original(con, sid, source)
+            return sid
         title = (source.get("title") or "").strip()
         if not title:
             raise KnowledgeError("source needs a title (e.g. the file name or page title)")
         values = {k: source.get(k) for k in SOURCE_FIELDS if source.get(k) not in (None, "")}
         if "published_on" in values:
             values["published_on"] = coerce(values["published_on"], "date")
+        if "original" in values:
+            values["original"] = vault.link_existing(self.vault_root, str(values["original"]))
+        sid = self._upsert_source(con, title, values)
+        self._store_original(con, sid, source)
+        return sid
+
+    def _upsert_source(self, con: sqlite3.Connection, title: str, values: dict[str, Any]) -> int:
         row = None
         if values.get("uri"):
             row = con.execute(f"SELECT id FROM {SOURCES_TABLE} WHERE uri = ?", (values["uri"],)).fetchone()
@@ -545,6 +598,23 @@ class Knowledge:
         cols = ", ".join(values)
         cur = con.execute(f"INSERT INTO {SOURCES_TABLE} ({cols}) VALUES ({', '.join('?' for _ in values)})", tuple(values.values()))
         return int(cur.lastrowid)
+
+    def _store_original(self, con: sqlite3.Connection, sid: int, source: dict[str, Any]) -> None:
+        """Keep the full original in the Obsidian vault: write transcribed text or copy a local file.
+
+        A source that already has an original keeps it; pass original=<vault path> to point it elsewhere.
+        """
+        text, file = source.get("original_text"), source.get("original_file")
+        if not text and not file:
+            return
+        row = dict(con.execute(f"SELECT * FROM {SOURCES_TABLE} WHERE id = ?", (sid,)).fetchone())
+        if row.get("original") and (self.vault_root / row["original"]).exists():
+            return
+        if file:
+            path = vault.copy_file(self.vault_root, self.originals_dir, str(file))
+        else:
+            path = vault.write_text(self.vault_root, self.originals_dir, row, str(text))
+        con.execute(f"UPDATE {SOURCES_TABLE} SET original = ? WHERE id = ?", (path, sid))
 
     # -------------------------------------------------------------- records
     def _resolve_ref(
@@ -732,6 +802,7 @@ class Knowledge:
                     raise KnowledgeError(f"Nothing was saved. record {i}: {exc}") from exc
         self._refresh(ds, tuple(touched))
         self.store.log("knowledge_records", term["id"], "add", {k: len(v) for k, v in result.items()})
+        self.index.sync()
         return {
             "entity": term["name"],
             "table": table,
@@ -796,6 +867,7 @@ class Knowledge:
                 raise KnowledgeError("action must be update or delete.")
         self._refresh(ds, tuple(touched))
         self.store.log("knowledge_records", term["id"], action, {"ids": ids})
+        self.index.sync()
         return {"entity": term["name"], **result, "total_records": self._count(table)}
 
     # ------------------------------------------------------------- concepts
@@ -888,6 +960,8 @@ class Knowledge:
                 )
         for r in rels:
             target = self._find_term(ds, r["target"])
+            if is_builtin(target) and self.is_knowledge(ds):
+                raise KnowledgeError(f"{target['name']!r} is a built-in table of the store, not a Term to relate to.")
             if target is None:
                 target_id = new_id("term")
                 self.store.insert(
@@ -924,8 +998,21 @@ class Knowledge:
                 )
                 removed += cur.rowcount
         self.store.log("concept", tid, "create" if created else "update", {"relations": len(rels), "removed": removed})
+        if self.is_knowledge(ds):
+            self.index.sync()
         view = self.svc.get_term(tid, datasource=ds["name"])
         return {"created": created, "stub_concepts_created": stubs, "relations_removed": removed, "concept": view}
+
+    # ------------------------------------------------------------- passages
+    def save_passages(
+        self, passages: list[dict[str, Any]] | None = None, source: Any = None, delete_ids: list[int] | None = None
+    ) -> dict[str, Any]:
+        return self.index.save_passages(passages, source, delete_ids)
+
+    def search_text(
+        self, query: str, kinds: list[str] | None = None, limit: int = 10, source: int | None = None, term: str | None = None
+    ) -> dict[str, Any]:
+        return self.index.search(query, kinds, limit, source, term)
 
     # -------------------------------------------------------------- reading
     def relations_view(self, term_id: str) -> list[dict[str, Any]]:
@@ -976,8 +1063,8 @@ class Knowledge:
         with self._write() as con:
             try:
                 total = con.execute(f"SELECT COUNT(*) FROM {q(table)}").fetchone()[0]
-                if table == SOURCES_TABLE:
-                    return {"records": total}
+                if is_builtin(term):
+                    return {"records": total, "built_in": True}
                 sourced = con.execute(f"SELECT COUNT(*) FROM {q(table)} WHERE _source_id IS NOT NULL").fetchone()[0]
                 n_sources = con.execute(f"SELECT COUNT(DISTINCT _source_id) FROM {q(table)}").fetchone()[0]
             except sqlite3.OperationalError:
@@ -1010,7 +1097,7 @@ class Knowledge:
             derived = []
             for t in self.store.terms(ds["id"]):
                 spec = t.get("spec")
-                if not spec or spec["table"] == SOURCES_TABLE:
+                if not spec or is_builtin(t):
                     continue
                 ids = [r[0] for r in con.execute(f"SELECT id FROM {q(spec['table'])} WHERE _source_id = ? ORDER BY id LIMIT 50", (src["id"],))]
                 if ids:
@@ -1030,7 +1117,11 @@ class Knowledge:
             """,
             (src["id"],),
         )
-        return {"source": src, "records": derived, "concepts": concepts, "relations": relations}
+        passages = self.index.passages_for(source_id=src["id"])
+        out = {"source": src, "records": derived, "concepts": concepts, "relations": relations, "passages": passages}
+        if src.get("original"):
+            out["original_link"] = vault.wikilink(src["original"], label=src["title"])
+        return out
 
     def sources_for_search(self) -> list[dict[str, Any]]:
         if not self.path.exists() or self.ds(create=False) is None:
@@ -1048,7 +1139,7 @@ class Knowledge:
         if ds is None:
             return {}
         terms = self.store.terms(ds["id"])
-        entities = [t for t in terms if t.get("spec") and t["spec"]["table"] != SOURCES_TABLE]
+        entities = [t for t in terms if t.get("spec") and not is_builtin(t)]
         concepts = [t for t in terms if (t.get("kind") or "entity") == "concept"]
         stubs = [t["name"] for t in concepts if not (t.get("description") or t.get("body"))]
         records = without_source = 0
@@ -1058,6 +1149,14 @@ class Knowledge:
             without_source += st.get("records", 0) - st.get("records_with_source", 0)
         n_sources = self.entity_stats(next((t for t in terms if t.get("spec", {}) and t["spec"]["table"] == SOURCES_TABLE), {})).get("records", 0) if terms else 0
         relations = self.store.scalar("SELECT COUNT(*) FROM term_relation WHERE datasource_id = ?", (ds["id"],)) or 0
+        passages = originals = 0
+        if self.path.exists():
+            with self._write() as con:
+                try:
+                    passages = con.execute("SELECT COUNT(*) FROM passages").fetchone()[0]
+                    originals = con.execute(f"SELECT COUNT(*) FROM {SOURCES_TABLE} WHERE original IS NOT NULL").fetchone()[0]
+                except sqlite3.OperationalError:
+                    pass
         return {
             "entities": [t["name"] for t in entities],
             "records": records,
@@ -1066,4 +1165,17 @@ class Knowledge:
             "stub_concepts": stubs[:30],
             "relations": relations,
             "sources": n_sources,
+            "sources_with_original": originals,
+            "passages": passages,
+            "vault": str(self.vault_root),
+            "full_text_search": self.index.fts_available(),
         }
+
+
+def _builtin_message(term: dict[str, Any]) -> str:
+    table = (term.get("spec") or {}).get("table")
+    if table == SOURCES_TABLE:
+        return "Source is built in; describe sources through the source parameter of the write tools."
+    if table == "passages":
+        return f"{term['name']} is built in; store passages with save_passages."
+    return f"{term['name']} is built in and read-only; it mirrors or indexes what save_concept, define_entity and save_passages store."

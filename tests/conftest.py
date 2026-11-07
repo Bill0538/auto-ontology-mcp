@@ -48,7 +48,7 @@ DEMO_TERMS: dict[str, list[dict]] = {
 @pytest.fixture()
 def settings(tmp_path: Path) -> Settings:
     base = Settings.from_env()
-    return replace(base, home=tmp_path, store_path=tmp_path / "ontology.db", token=None)
+    return replace(base, home=tmp_path, store_path=tmp_path / "ontology.db", token=None, vault=None)
 
 
 @pytest.fixture()

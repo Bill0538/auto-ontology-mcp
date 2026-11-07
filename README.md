@@ -26,7 +26,7 @@
 **Auto Ontology MCP** (`auto-ontology-mcp`) brings [NVIDIA Auto Ontology](https://github.com/NVIDIA/auto-ontology)'s semantic layer to any MCP client, for two jobs:
 
 - **Ask your databases.** Point it at a database, and the model you already use (Claude Code, Codex, OpenClaw, Hermes Agent, Cursor, VS Code, or the Claude and ChatGPT apps) builds business Terms, reviews joins and answers questions with SQL that the server checks against the ontology and the data.
-- **Keep a personal knowledge base.** Share receipts, statements, papers, book notes or screenshots with your assistant; it reads them and stores the facts as records, the ideas as linked concepts, and where each came from. Later questions get exact numbers and cited sources.
+- **Keep a personal knowledge base.** Share receipts, statements, papers, book notes or screenshots with your assistant; it reads them and stores the facts as records, the ideas as linked concepts, the passages worth finding again in a full-text index, and where each came from. The full originals stay in your Obsidian vault. Later questions get exact numbers, searchable quotes and links back to the original.
 
 > [!TIP]
 > **Use it in place of an LLM Wiki.** In Karpathy's [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f) pattern the model compiles your sources into markdown pages that you read in Obsidian. Auto Ontology MCP runs the same loop (ingest, query, lint, with an index and a log) on an ontology instead of loose pages: facts go into typed tables you can sum, filter and compare with SQL, ideas become concept pages with typed links, every record, page and link keeps its source and the quote behind it, and `export_wiki` writes it all out as an Obsidian vault with aliases, `[[links]]` and the graph view. [How the two map](#personal-knowledge-base)
@@ -48,7 +48,11 @@ Text-to-SQL fails quietly. The query runs, a number comes back, and nothing says
 
 ## See it in action
 
-The repository ships a synthetic retail database for trying this out (11 tables, 3,200 orders). Below is a question asked after the tables were modeled. Tool output is abridged from a real run of the test fixtures; the model's replies are illustrative.
+`auto-ontology-mcp demo` sets up three demos about one fictional store: a synthetic retail database (11 tables, 3,200 orders), three of the store's documents in the knowledge store (a meeting note, a tag guide and a quality digest, with their originals in the Obsidian vault), and questions that need both. Tool output below is abridged from real runs of the test fixtures (`tests/test_demo.py`); the model's replies are illustrative.
+
+### 1. Structured data: the retail database
+
+A question asked after the tables were modeled:
 
 ```text
 You     What was revenue for the sushi roll flash drive in Pennsylvania in June 2024?
@@ -92,6 +96,94 @@ Model   This database has sales but no advertising spend, so I can't compute ROA
         I can give you revenue for that product instead.
 ```
 
+### 2. Unstructured data: the store's documents
+
+The demo stores the three documents the way a model would after reading them: each full text as an original note in the vault, the passages worth finding again, the concepts and causal links they describe, and the action items they decide.
+
+```text
+You     [Merchandising tag guide] Remember this.
+
+Model   → save_passages(source={title: "Merchandising tag guide", kind: "wiki", original_text: "# Merchandising tag guide …"},
+              passages=[{heading: "bestseller", text: "A product the buyers want to feature …", terms: ["Bestseller Tag"]}, …])
+          original kept in the vault: originals/Merchandising tag guide.md
+        → save_concept("Bestseller Tag", relations=[is_a Merchandising Tag], source=2, locator="bestseller")
+
+You     What does the bestseller tag mean?
+
+Model   → search_text("bestseller")
+          term     Bestseller Tag                          [Bestseller] Tag
+          passage  Merchandising tag guide › bestseller    "A product the buyers want to feature on the home page.
+                                                            It is a placement decision and does not mean the
+                                                            product sells the most units."
+                   link: [[originals/Merchandising tag guide#bestseller]]
+
+Model   Buyers pick it for home-page placement; it is not a sales ranking
+        ([[originals/Merchandising tag guide#bestseller]]).
+
+You     What led to the Midwest sales decline?
+
+Model   → run_sql(datasource="knowledge", sql="WITH RECURSIVE chain AS (… FROM term_relations r JOIN chain
+              ON r.to_term_id = chain.id WHERE r.relation IN ('causes', 'part_of')) …")
+          Fewer Repeat Orders   part_of   1
+          Delivery Delay        causes    2
+          September Stockout    causes    2
+          Fulfilment Cutover    causes    3
+
+You     Which product problems sent products back?
+
+Model   → run_sql(datasource="knowledge", sql="SELECT t.name, p.heading, snippet(passages_fts, …)
+              FROM passages_fts JOIN passages p … JOIN passage_terms … JOIN terms t … JOIN term_relations r …
+              WHERE passages_fts MATCH '"returns"* OR "back"' AND r.relation = 'instance_of'
+              AND r.to_term = 'Product Quality Issue' ORDER BY bm25(passages_fts)")
+          Wobbling Chair Base    Office Chair                  …Several chairs came [back] before support …
+          Ear Cushion Cracking   Noise Cancelling Headphones   …the product customers sent [back] most often.
+```
+
+The last query is a full-text search, a walk over typed relations and a join to the passages, in one SQL statement that `validate_sql` checks like any other.
+
+### 3. Structured and unstructured together
+
+The database says what happened; the documents say why. The model queries both datasources and keeps the numbers and the explanations apart.
+
+```text
+You     Why did Midwest revenue fall in 2024?
+
+Model   → run_sql(datasource="demo", sql="SELECT substr(o.order_date, 6, 2) AS month, … WHERE r.region_name = 'Midwest' …")
+          month   orders_2023   orders_2024
+          01      32            17
+          02      30            19
+          09      34            16
+        → search_text("Midwest January September", kinds=["passage"])
+          Midwest sales review, Q3 2024 › Summary   "Midwest orders fell behind last year twice in 2024:
+                                                     in [January] and February, and again in [September]. …"
+        → run_sql(datasource="knowledge", sql="WITH RECURSIVE … term_relations …")
+          Fulfilment Cutover → Delivery Delay → Fewer Repeat Orders ← September Stockout
+
+Model   Midwest orders dropped to 17 and 19 in January and February 2024 (32 and 30 a year earlier) and to 16 in
+        September (34). The Q3 sales review gives the reasons: fulfilment moved to Lakeshore Logistics on January 8
+        and deliveries took eight days instead of three, then Lakeshore ran out of desks and chairs in early September
+        ([[originals/Midwest sales review, Q3 2024#January cutover]], [[…#September stockout]]).
+
+You     Which open action items deal with that, and who owns them?
+
+Model   → run_sql(datasource="knowledge", sql="SELECT a.title, a.owner, a.due_on, group_concat(DISTINCT p.heading)
+              FROM action_items a JOIN sources s ON s.id = a._source_id JOIN passages p ON p.source_id = s.id
+              JOIN passages_fts ON passages_fts.passage_id = p.id
+              WHERE a.status = 'open' AND passages_fts MATCH '"stockout"* OR "delivery"*' GROUP BY …")
+          Move Ohio and Michigan fulfilment back to Columbus   Min Lee         2025-01-31   January cutover, September stockout
+          Send a win-back offer to Midwest customers           Dana Whitfield  (none)       January cutover, September stockout
+
+You     Do bestseller products sell more?
+
+Model   → run_sql(datasource="demo", …)    bestseller: 7 products, 1,309 units each on average; other: 11 products, 1,365
+        → search_text("bestseller")         "It is a placement decision and does not mean the product sells the most units."
+
+Model   No: bestseller products sold slightly fewer units on average (1,309 against 1,365). That fits the tag guide,
+        which says buyers assign the tag for home-page placement rather than from sales.
+```
+
+Remove everything the demo added to the knowledge store and the vault with `auto-ontology-mcp demo --remove`; `--no-knowledge` sets up only the database.
+
 ## What it does
 
 | | |
@@ -103,7 +195,10 @@ Model   This database has sales but no advertising spend, so I can't compute ROA
 | **Answerability** | Matches the question's entities to Terms, attributes, SQL attributes and glossary entries, and to names stored in the data (products, places, statuses) |
 | **Validation** | Unknown columns (with the ontology's name for them), joins the ontology does not know, near-miss literals, percent-vs-fraction thresholds, one-to-many fan-out, and a dry run |
 | **Governance** | Draft, certified and deprecated status on Terms and SQL attributes; editing a certified definition returns it to draft. Verified question and SQL pairs feed later answers |
-| **Knowledge store** | A writable store for what your assistant reads: entities with typed columns and references, concepts with a markdown body and typed relations, and a source with locator and quote behind every record. An index, a change log and an Obsidian export make it usable as an LLM Wiki |
+| **Knowledge store** | A writable store for what your assistant reads: entities with typed columns and references, concepts with a markdown body and typed relations, passages (excerpts and section summaries), and a source with locator and quote behind every record. An index, a change log and an Obsidian export make it usable as an LLM Wiki |
+| **Full-text search** | FTS5 indexes over passages, Term bodies and sources, ranked with bm25. Prefix matching finds words with Korean particles attached (기억 → 기억을), and a substring pass finds them inside compounds. `search_text` returns snippets, headings and `[[links]]` to the originals |
+| **Concept graph in SQL** | Terms, typed relations, Term sources and passages are tables next to the records, and the FTS indexes are queryable too, so one validated query can combine a text search, a `WITH RECURSIVE` walk over relations and the records |
+| **Originals in Obsidian** | The full text of each source stays in your Obsidian vault: a note already there, transcribed text saved as a new note, or a copied PDF or image. The store keeps the summary and excerpts and links back to the heading they came from |
 | **Portable** | Export and import the whole semantic layer as one YAML or JSON document |
 
 Results of the scan on the demo database, as reported by `auto-ontology-mcp demo`:
@@ -116,7 +211,7 @@ Results of the scan on the demo database, as reported by `auto-ontology-mcp demo
 
 You need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
-**1. Create the demo database** (or skip to [your own database](#connect-your-database)):
+**1. Set up the demos** (or skip to [your own database](#connect-your-database)). This creates the retail database and stores three demo documents in the knowledge store, with their originals in `~/.auto-ontology-mcp/wiki/knowledge/originals`:
 
 ```bash
 uvx --from git+https://github.com/gogoymh/auto-ontology-mcp auto-ontology-mcp demo
@@ -252,8 +347,9 @@ The `search` and `fetch` tools follow the shape ChatGPT expects from connectors 
 1. *"Use auto-ontology to build the ontology for the demo datasource: review the proposed joins, model every table, then save useful SQL attributes."* (or pick the `build_ontology` prompt)
 2. *"Which states brought in the most delivered revenue in 2024?"*
 3. *"What was return on ad spend last quarter?"* The answer should be that the data cannot say.
-4. Attach a receipt, a statement or your notes on a book and say *"Remember this."* (or pick the `remember` prompt). See [Personal knowledge base](#personal-knowledge-base).
-5. *"Export my knowledge base for Obsidian."* `export_wiki` writes a vault to `~/.auto-ontology-mcp/wiki/knowledge`; open that folder in Obsidian.
+4. *"Why did Midwest revenue fall in 2024?"* The numbers come from the database, the reasons from the demo documents.
+5. Attach a receipt, a statement, an article or your notes on a book and say *"Remember this."* (or pick the `remember` prompt). See [Personal knowledge base](#personal-knowledge-base).
+6. *"Export my knowledge base for Obsidian."* `export_wiki` writes pages next to the originals in `~/.auto-ontology-mcp/wiki/knowledge`; open that folder in Obsidian as a vault.
 
 ## Connect your database
 
@@ -285,9 +381,43 @@ Your assistant can already read PDFs, photos, web pages and notes. What it lacks
 | --- | --- | --- |
 | **Entity** | Facts you will count, sum, filter or compare: a Term with its own table, typed columns and references to other entities | `Receipt`: paid_on, merchant → `Merchant`, category, total_krw |
 | **Concept** | Meaning: a one-line definition, a markdown body and typed relations (`is_a`, `part_of`, `related_to`, `causes`, ...) | `Spaced Repetition` is_a `Learning Technique`, related_to `Forgetting Curve` |
-| **Source** | Where each record, concept and relation came from, with a locator and the quote behind it | `IMG_2041.jpg`, line 3; *Make It Stick*, ch. 2 |
+| **Passage** | An excerpt or a section summary worth finding again, with its heading or locator in the original and the Terms it is about; full-text indexed | *Make It Stick*, ch. 2: "Retrieval practice beats rereading." about `Retrieval Practice` |
+| **Source** | Where each record, concept, relation and passage came from, with a locator and the quote behind it, and the path of the full original in the Obsidian vault | `IMG_2041.jpg`, line 3; `originals/Make It Stick ch2.md` |
 
 The store is created the first time the model saves something (datasource `knowledge`, file `~/.auto-ontology-mcp/knowledge.sqlite`). Everything else in this README applies to it as well: synonyms in your own language, the glossary, SQL attributes for definitions like "eating out", validation, certification and verified example queries.
+
+### Originals in Obsidian, summaries and excerpts in the store
+
+A long document does not belong in a database row, and an excerpt is no use without the page around it. So the full original stays in your Obsidian vault, where you read and annotate it, and the store keeps what you search and count: a summary on the source, passages for the parts worth finding again, records for the facts and concepts for the ideas. A source points at its original in one of three ways:
+
+| Source field | When | What happens |
+| --- | --- | --- |
+| `original` | The note is already in your vault (a web clipping, your own notes) | The path is checked and stored, relative to the vault |
+| `original_text` | The text exists only in the conversation (a web page the model read, a transcript) | Written as a new note in `originals/`, with the source's title, URI and date as frontmatter |
+| `original_file` | A local PDF, image or document | Copied into `originals/`. Hidden files and other file types are refused |
+
+Existing files are never overwritten; a different original with the same name gets a numbered name. Passages carry the heading they came from, so search results and exported pages link to `[[originals/Note#Heading]]` and Obsidian opens the original at that section. Set `AUTO_ONTOLOGY_VAULT` to your own vault and the generated pages and originals go to its `auto-ontology/` folder; otherwise `~/.auto-ontology-mcp/wiki/knowledge` is the vault.
+
+### Searching and combining
+
+`search_text` searches passages, Term definitions and bodies, and sources with SQLite FTS5 (bm25 ranking), and returns snippets, headings, the Terms each passage is about and a link to the original. Words match with their Korean particles (기억 finds 기억을) and inside compounds (곡선 finds 망각곡선을).
+
+The same data is in tables next to your records, so SQL can combine them: `terms`, `term_relations` (walk chains with `WITH RECURSIVE`), `term_sources`, `passages`, `passage_terms`, and the indexes `passages_fts`, `terms_fts` and `sources_fts`:
+
+```sql
+-- Passages that mention 간격 and are about a concept that is_a Learning Technique
+SELECT s.title, p.heading, snippet(passages_fts, 3, '[', ']', '…', 12) AS hit
+FROM passages_fts
+JOIN passages p ON p.id = passages_fts.passage_id
+JOIN sources s ON s.id = p.source_id
+JOIN passage_terms pt ON pt.passage_id = p.id
+JOIN terms t ON t.id = pt.term_id
+JOIN term_relations r ON r.from_term_id = t.id
+WHERE passages_fts MATCH '"간격"*' AND r.relation = 'is_a' AND r.to_term = 'Learning Technique'
+ORDER BY bm25(passages_fts);
+```
+
+`validate_sql` knows these tables, their joins and the FTS functions, so these queries get the same checks as any other. The Term tables mirror the ontology and are read-only; change Terms through `save_concept`, `define_entity` and `update_term`.
 
 ### A session
 
@@ -331,30 +461,31 @@ Every part of the [LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9
 
 | LLM Wiki | Auto Ontology MCP |
 | --- | --- |
-| Raw sources the model reads but never edits | Sources: title, path or URL, summary and the transcribed excerpt, linked from every record, concept and relation |
+| Raw sources the model reads but never edits | Originals in the Obsidian vault, and sources in the store: title, path or URL, summary and the vault path of the original, linked from every record, concept, relation and passage |
 | Wiki pages the model writes | Concepts (definition, markdown body, typed relations) and entities (records with typed columns) |
 | Schema file (`CLAUDE.md`, `AGENTS.md`) | Rules the server sends with its handshake and tools, plus the `remember` prompt |
-| Ingest | `remember` → `define_entity`, `add_records`, `save_concept` |
-| Query | `search_ontology` (Terms, bodies, sources, record values), `get_term`, `check_answerable`, `run_sql` |
+| Ingest | `remember` → `define_entity`, `add_records`, `save_concept`, `save_passages` |
+| Query | `search_text` (full text of passages, bodies and sources), `search_ontology` (Terms, record values), `get_term`, `check_answerable`, `run_sql` |
 | Filing good answers back | `save_concept(append_body=...)`, `save_example_query` |
 | Lint | `review_ontology` prompt; `check_readiness` counts empty concepts and records without a source |
 | `index.md` | `list_terms` |
 | `log.md` | `recent_changes` |
-| Obsidian as the viewer | `export_wiki`: a vault with one page per Term (synonyms as aliases, relations as `[[links]]`), one per source, plus `index.md` and `log.md` |
+| Obsidian as the viewer | `export_wiki`: one page per Term (synonyms as aliases, relations as `[[links]]`, its passages), one per source (link to the original, its passages), plus `index.md` and `log.md`, next to the originals |
 
 What the structure adds on top of markdown pages:
 
 - **Numbers you can trust.** "How much on eating out in October?" is a SQL sum over typed records, checked by `validate_sql`, not arithmetic over prose.
 - **Provenance per fact.** Each record carries its source, locator and quote, so an answer can say which receipt or page it came from.
 - **No silent duplicates or broken data.** Keys and duplicate detection stop the same receipt from being stored twice, and invalid dates, amounts or columns reject the whole batch with reasons.
-- **Typed links.** `is_a`, `part_of`, `causes` and the like instead of bare backlinks, so "what are the parts of X" has an answer.
+- **Typed links.** `is_a`, `part_of`, `causes` and the like instead of bare backlinks, so "what are the parts of X" has an answer, in SQL if you like.
+- **Search and lookups in one query.** A full-text match, a walk over relations and a filter on records can share one SQL statement.
 - **Review states.** Draft, certified and deprecated, as in Auto Ontology, so you know which definitions a person confirmed.
 
 Limits to know about:
 
-- The Obsidian vault is a one-way view. Edits made in Obsidian are not read back; change knowledge through the assistant and run `export_wiki` again (it replaces only the pages it generated).
-- Search is lexical. Add the words you use as synonyms so they match.
-- Original files are not copied. A source keeps its title, path or URL, a summary and the excerpt the model transcribed.
+- Generated pages are a one-way view. Edits made to them in Obsidian are not read back; change knowledge through the assistant and run `export_wiki` again (it replaces only the pages it generated and never touches originals or pages you wrote).
+- Search is lexical, not semantic: FTS5 matches words and prefixes, not meaning. Search with the words the sources use, add your own words as synonyms, and translate when the sources are in another language.
+- The store indexes passages, not whole originals. What the model did not save as a passage or summary is in the vault but not in `search_text`.
 - It is a single-user store on your machine. Back it up by copying `~/.auto-ontology-mcp`.
 
 Large existing tables (bank exports, workout logs) load faster with [sqlite-utils](https://sqlite-utils.datasette.io/) into their own database, connected read-only next to the store:
@@ -393,7 +524,7 @@ Reading the photo is up to the agent's model, so use one that accepts images. Th
 | SQL attributes | `suggest_sql_attributes`, `save_sql_attribute` |
 | Explore | `search_ontology`, `get_term`, `describe_table`, `lookup_values` |
 | Answer | `check_answerable`, `get_query_context`, `validate_sql`, `run_sql`, `save_example_query` |
-| Knowledge store | `define_entity`, `add_records`, `edit_records`, `save_concept`, `get_source`, `list_terms`, `recent_changes`, `export_wiki` |
+| Knowledge store | `define_entity`, `add_records`, `edit_records`, `save_concept`, `save_passages`, `search_text`, `get_source`, `list_terms`, `recent_changes`, `export_wiki` |
 | Share | `export_ontology`, `import_ontology` |
 | ChatGPT connectors | `search`, `fetch` |
 
@@ -408,7 +539,8 @@ flowchart LR
     U([You]) <--> M["Your MCP client's model<br/>Claude Code, Codex, OpenClaw,<br/>Hermes, Cursor, ...<br/>names Terms, reviews joins,<br/>extracts entities, writes SQL"]
     M <-- "MCP<br/>stdio or HTTP" --> S["auto-ontology-mcp<br/>scans, profiles, infers keys,<br/>validates, stores, runs read-only"]
     S <--> O[("ontology.db<br/>Terms, relationships,<br/>SQL attributes")]
-    S <-- "validated writes" --> K[("knowledge.sqlite<br/>records, sources")]
+    S <-- "validated writes" --> K[("knowledge.sqlite<br/>records, sources, passages,<br/>Term mirror, FTS5 indexes")]
+    S -- "originals and pages" --> V[("Obsidian vault")]
     S -- "read-only" --> D[("Your databases")]
 ```
 
@@ -427,9 +559,9 @@ Each step of Auto Ontology maps to one side of that line:
 | Storage | Postgres and pgvector | Local SQLite files |
 | Ingesting knowledge | Ingestion service reads databases | The model reads files, images and notes; the server validates and stores the records, concepts and sources it extracts |
 
-Search is lexical (token overlap, trigram similarity, phrase match) because there is no embedding model. The server instructions ask the model to search with the schema's vocabulary, translate non-English phrases, and add the user's own words as synonyms with `update_term(add_synonyms=[...])`, after which they match directly.
+Search is lexical because there is no embedding model: token overlap, trigram similarity and phrase match for Terms and columns, and SQLite FTS5 with bm25 for the text of passages, bodies and sources. The server instructions ask the model to search with the schema's vocabulary, translate non-English phrases, and add the user's own words as synonyms with `update_term(add_synonyms=[...])`, after which they match directly.
 
-Not carried over from Auto Ontology: the web UI and REST API, users, groups and RBAC, zones (access scoping), tags and rules, PII detection, JSONB path checks, embedding search and reranking, chart generation, KumoRFM predictions and Apache Ossie interchange (export and import use this project's own YAML format). Added here and not in Auto Ontology: write access over MCP, the personal knowledge store (Auto Ontology ingests databases, not documents), concept pages with typed relations, provenance on records, and the Obsidian export.
+Not carried over from Auto Ontology: the web UI and REST API, users, groups and RBAC, zones (access scoping), tags and rules, PII detection, JSONB path checks, embedding search and reranking, chart generation, KumoRFM predictions and Apache Ossie interchange (export and import use this project's own YAML format). Added here and not in Auto Ontology: write access over MCP, the personal knowledge store (Auto Ontology ingests databases, not documents), concept pages with typed relations, provenance on records, passages with full-text search, originals kept in Obsidian, and the Obsidian export.
 
 ## Safety
 
@@ -455,6 +587,7 @@ Over HTTP, a token is required to reach the server from anywhere but localhost: 
 | --- | --- | --- |
 | `AUTO_ONTOLOGY_HOME` | `~/.auto-ontology-mcp` | Where the ontology store, the knowledge store (`knowledge.sqlite`) and the demo database live |
 | `AUTO_ONTOLOGY_STORE` | `$AUTO_ONTOLOGY_HOME/ontology.db` | Ontology store file |
+| `AUTO_ONTOLOGY_VAULT` | unset | Your Obsidian vault. Originals and generated pages go to its `auto-ontology/` folder, and `original` paths are relative to it. Unset: `$AUTO_ONTOLOGY_HOME/wiki/knowledge` is the vault |
 | `AUTO_ONTOLOGY_MAX_ROWS` | `500` | Upper bound on rows `run_sql` returns |
 | `AUTO_ONTOLOGY_QUERY_TIMEOUT_S` | `30` | Per-query timeout in seconds |
 | `AUTO_ONTOLOGY_PROFILE_ROWS` | `1000` | Rows sampled per table while profiling |
@@ -469,7 +602,8 @@ Over HTTP, a token is required to reach the server from anywhere but localhost: 
 ```text
 auto-ontology-mcp                      stdio MCP server (what desktop clients launch)
 auto-ontology-mcp serve --transport http --port 8765 --token ...
-auto-ontology-mcp demo                 create and register the demo database
+auto-ontology-mcp demo                 the retail database 'demo' and three demo documents in the knowledge store
+auto-ontology-mcp demo --remove        remove the demo database registration and everything the demo documents added
 auto-ontology-mcp add NAME URL         register and scan a datasource
 auto-ontology-mcp scan NAME            re-scan; reviewed joins and Terms are kept
 auto-ontology-mcp list                 readiness of every datasource
@@ -500,7 +634,10 @@ AO_TEST_PG_URL=postgresql+psycopg://postgres:pw@127.0.0.1:55432/postgres uv run 
 | --- | --- |
 | `catalog.py`, `profiling.py`, `inference.py` | Schema extraction, profiling, key and bridge-table inference |
 | `knowledge.py` | The writable knowledge store: entities, records, concepts, relations, sources |
+| `textindex.py` | Passages, the SQL mirror of Terms and relations, FTS5 indexes and `search_text` |
+| `vault.py` | Originals in the Obsidian vault: linking, writing and copying them |
 | `wiki.py` | Obsidian vault export |
+| `demo.py`, `demo_knowledge.py` | The demo database and the demo documents |
 | `service.py` | Everything behind the tools |
 | `validation.py`, `sqlcheck.py` | Read-only guard, column lineage, probe-based validation |
 | `search.py`, `graph.py` | Lexical search, join paths |

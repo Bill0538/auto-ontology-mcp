@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Any
 
 import yaml
 
-from .knowledge import SOURCES_TABLE, q
+from .knowledge import SOURCES_TABLE, is_builtin, q
+from .vault import wikilink
 
 if TYPE_CHECKING:  # pragma: no cover
     from .service import OntologyService
@@ -67,10 +68,28 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
     terms = svc.store.terms(ds["id"])
     page_of = {t["id"]: safe_name(t["name"]) for t in terms}
     written: set[Path] = set()
+    skipped: list[str] = []
 
     def write(path: Path, text: str) -> None:
+        if path.exists() and not _is_generated(path):
+            skipped.append(path.name)  # a page the user wrote; never overwrite it
+            return
         path.write_text(text, encoding="utf-8")
         written.add(path.resolve())
+
+    def passage_line(p: dict[str, Any], with_source: bool) -> str:
+        where = ", ".join(x for x in (p.get("heading"), p.get("locator")) if x)
+        text = " ".join(p["text"].split())
+        line = f"- {'> ' if p['kind'] == 'quote' else ''}{text}" + (f" ({p['kind']})" if p["kind"] != "quote" else "")
+        if p.get("original"):
+            line += " " + wikilink(p["original"], p.get("heading"), label=where or "original")
+        elif where:
+            line += f" ({where})"
+        if with_source and p["source_id"] in source_pages:
+            line += f" from [[{source_pages[p['source_id']]}|{p['source_title']}]]"
+        if p.get("terms"):
+            line += " about " + ", ".join(f"[[{safe_name(n)}]]" for n in p["terms"])
+        return line
 
     # Sources (knowledge store only).
     source_pages: dict[int, str] = {}
@@ -90,8 +109,9 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
         (ds["id"],),
     )
 
-    # The built-in Source entity is shown as the sources/ folder instead of a Term page.
-    terms = [t for t in terms if (t.get("spec") or {}).get("table") != SOURCES_TABLE]
+    # Built-in tables (sources, passages, the Term mirror, search indexes) get no Term page;
+    # sources are shown as the sources/ folder.
+    terms = [t for t in terms if not (k.is_knowledge(ds) and is_builtin(t))]
     labels = _record_labels(k, svc.store.terms(ds["id"])) if k.is_knowledge(ds) and k.path.exists() else {}
 
     for t in terms:
@@ -162,6 +182,9 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
                 if total > len(rows):
                     lines.append(f"\nShowing the latest {len(rows)}. Query the rest with run_sql.")
                 lines.append("")
+        passages = k.index.passages_for(term_id=t["id"]) if k.is_knowledge(ds) else []
+        if passages:
+            lines += [f"## Passages ({len(passages)})", ""] + [passage_line(p, with_source=True) for p in passages] + [""]
         if view.get("sources"):
             lines.append("## Sources")
             for src in view["sources"]:
@@ -175,10 +198,13 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
         detail = k.get_source(src["id"])
         lines = [
             _frontmatter({"generated_by": MARKER, "kind": src.get("kind"), "uri": src.get("uri"), "author": src.get("author"),
-                          "published_on": src.get("published_on"), "captured_at": src.get("captured_at")}),
+                          "published_on": src.get("published_on"), "captured_at": src.get("captured_at"),
+                          "original": src.get("original")}),
             f"# {src['title']}",
             "",
         ]
+        if src.get("original"):
+            lines += [f"Original: {wikilink(src['original'])}", ""]
         if src.get("summary"):
             lines += [src["summary"], ""]
         if detail["records"] or detail["concepts"]:
@@ -188,6 +214,8 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
             for c in detail["concepts"]:
                 lines.append(f"- [[{safe_name(c['name'])}]]" + (f", {c['locator']}" if c.get("locator") else ""))
             lines.append("")
+        if detail.get("passages"):
+            lines += [f"## Passages ({len(detail['passages'])})", ""] + [passage_line(p, with_source=False) for p in detail["passages"]] + [""]
         if src.get("content"):
             lines += ["## Content", "", src["content"], ""]
         write(directory / f"{source_pages[src['id']]}.md", "\n".join(lines))
@@ -221,7 +249,10 @@ def export_wiki(svc: "OntologyService", ds: dict[str, Any], directory: Path) -> 
         "directory": str(directory),
         "pages": len(written),
         "removed_stale_pages": removed,
-        "next_step": "Open this folder in Obsidian (or put it inside your vault). The store stays the source of truth: "
-        "edits made in Obsidian are not read back, so change knowledge through the assistant and export again.",
+        "skipped_user_pages": skipped,
+        "originals": str(k.originals_dir) if k.is_knowledge(ds) else None,
+        "next_step": "Open the vault in Obsidian. The store stays the source of truth for generated pages: edits made "
+        "to them in Obsidian are not read back, so change knowledge through the assistant and export again. Originals "
+        "are ordinary notes and files: edit them freely.",
     }
 

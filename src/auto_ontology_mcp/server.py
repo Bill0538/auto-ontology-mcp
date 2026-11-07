@@ -66,7 +66,20 @@ class SourceInput(BaseModel):
     author: str | None = None
     published_on: str | None = Field(default=None, description="YYYY-MM-DD")
     summary: str | None = Field(default=None, description="What the source is about, in a sentence or two.")
-    content: str | None = Field(default=None, description="Transcribed text or the relevant excerpt.")
+    content: str | None = Field(default=None, description="A short excerpt; save longer parts as passages and keep the full text as the original.")
+    original: str | None = Field(default=None, description="Path of the original that is already in the Obsidian vault, relative to the vault, e.g. 'Clippings/Article.md'.")
+    original_text: str | None = Field(default=None, description="Full text (markdown) to keep as the original: written as a new note in the vault's originals folder. Use it for web pages, chats and transcriptions that exist nowhere else.")
+    original_file: str | None = Field(default=None, description="Absolute path of a local file (PDF, image, document) to copy into the vault as the original.")
+
+
+class PassageInput(BaseModel):
+    text: str = Field(description="One idea from the source: the words as written (kind quote) or your summary of one section (kind summary). Split long text into several passages.")
+    kind: Literal["quote", "summary", "note"] = Field(default="quote", description="quote (words as written), summary (a section in other words) or note (the user's own comment).")
+    heading: str | None = Field(default=None, description="Section heading in the original; links then open the original at that heading.")
+    locator: str | None = Field(default=None, description="Page, timestamp or line, e.g. 'p. 12', '00:13:20', 'line 40'.")
+    terms: list[str] | None = Field(default=None, description="Terms (concepts or entities) the passage is about; missing ones are created as empty concepts.")
+    note: str | None = None
+    id: int | None = Field(default=None, description="Existing passage id to update.")
 
 
 class RelationInput(BaseModel):
@@ -388,14 +401,48 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
         removes = [r.model_dump() for r in remove_relations] if remove_relations else None
         return svc.knowledge.save_concept(name, description, body, append_body, synonyms, rels, removes, src, locator, evidence, status, datasource)
 
+    @tool(WRITE_DESTRUCTIVE, title="Save passages of a source")
+    def save_passages(
+        passages: Annotated[list[PassageInput] | None, Field(description="Excerpts or section summaries to save.")] = None,
+        source: SourceArg = None,
+        delete_ids: Annotated[list[int] | None, Field(description="Passage ids to delete (permanent; confirm with the user first).")] = None,
+    ) -> dict[str, Any]:
+        """Save excerpts and section summaries of one source (an article, paper, book chapter, meeting
+        note) so they can be searched with search_text and cited, each with its heading or locator in
+        the original and the Terms it is about. The full original stays in the Obsidian vault: point
+        the source at a note already there (source.original), or pass source.original_text or
+        source.original_file to keep it there. Keep one idea per passage. A passage with the same text
+        from the same source updates instead of duplicating; delete_ids removes passages. Use
+        add_records for countable facts and save_concept for definitions."""
+        src = source.model_dump(exclude_none=True) if isinstance(source, SourceInput) else source
+        items = [x.model_dump(exclude_none=True) for x in passages] if passages else None
+        return svc.knowledge.save_passages(items, src, delete_ids)
+
+    @tool(READ, title="Full-text search")
+    def search_text(
+        query: Annotated[str, Field(description="Words to find, as written in the sources (any language).")],
+        kinds: Annotated[list[Literal["passage", "term", "source"]] | None, Field(description="Restrict to passages, Term bodies or sources.")] = None,
+        source: Annotated[int | None, Field(description="Only this source id.")] = None,
+        term: Annotated[str | None, Field(description="Only passages linked to this Term.")] = None,
+        limit: Annotated[int, Field(description="Maximum hits (max 50).")] = 10,
+    ) -> dict[str, Any]:
+        """Search the text of the knowledge store: passages, Term definitions and bodies, and sources.
+        Returns ranked hits (bm25) with the matching words in [brackets], the heading or locator, the
+        Terms each passage is about and a [[link]] to the original in Obsidian. Words match with their
+        Korean particles (기억 finds 기억을) and inside compounds. Also returns the FTS query and a SQL
+        example, so you can combine the search with records, relations and sources in one run_sql:
+        passages_fts MATCH ... joined to passages, passage_terms, terms, term_relations and sources.
+        Read-only."""
+        return svc.knowledge.search_text(query, list(kinds) if kinds else None, limit, source, term)
+
     @tool(READ, title="Show a source")
     def get_source(
         source: Annotated[str, Field(description="Source id (e.g. '3' or 'source:3') or part of its title.")],
     ) -> dict[str, Any]:
-        """Show one source (by id or part of its title) with its summary and content, and everything stored
-        from it: records per entity, concepts and relations. Use it to cite where an answer came
-        from or to review what a document contributed; use search_ontology to find sources by topic.
-        Read-only."""
+        """Show one source (by id or part of its title) with its summary, content and the path of its
+        original in the Obsidian vault, and everything stored from it: records per entity, concepts,
+        relations and passages. Use it to cite where an answer came from or to review what a document
+        contributed; use search_text to find sources by their words. Read-only."""
         return svc.knowledge.get_source(source)
 
     @tool(READ, title="Index of Terms")
@@ -421,12 +468,13 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
 
     @tool(WRITE, title="Export as an Obsidian vault")
     def export_wiki(datasource: DatasourceArg = None) -> dict[str, Any]:
-        """Write the ontology (by default the knowledge store) as an Obsidian vault in
-        ~/.auto-ontology-mcp/wiki/<datasource>: one page per Term with synonyms as aliases and
-        relations as [[links]], one per source, plus index.md and log.md. Use it when the user wants
-        to browse their knowledge visually. Re-exporting rewrites and prunes only pages it
-        generated; other files in the folder are left alone. Edits made in Obsidian are not read
-        back. Use export_ontology for a single YAML/JSON document."""
+        """Write the ontology (by default the knowledge store) as Obsidian pages: one page per Term with
+        synonyms as aliases, relations as [[links]] and its passages, one per source with a link to
+        the original and its passages, plus index.md and log.md. The knowledge store goes to the
+        vault (AUTO_ONTOLOGY_VAULT/auto-ontology, or ~/.auto-ontology-mcp/wiki/knowledge), other
+        datasources to ~/.auto-ontology-mcp/wiki/<datasource>. Re-exporting rewrites and prunes only
+        pages it generated; originals and other files are never touched. Edits made in Obsidian are
+        not read back. Use export_ontology for a single YAML/JSON document."""
         return svc.export_wiki(datasource)
 
     # -------------------------------------------------------------- reading
@@ -442,10 +490,11 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
     ) -> dict[str, Any]:
         """Find Terms, concepts (including their bodies and relations), mapped columns, SQL attributes,
         glossary entries, verified example questions, sources and unmodeled tables by words. In the
-        knowledge store it also matches records by their stored text ('value' hits). Use it to
-        locate things by name or topic; use list_terms to browse everything and get_term for full
-        detail. Matching is lexical, not semantic: use the schema's vocabulary, try synonyms and
-        translate. Read-only."""
+        knowledge store it also matches records by their stored text ('value' hits) and adds the top
+        full-text hits from passages, bodies and sources ('text_hits'). Use it to locate things by name
+        or topic; use search_text to search the text itself, list_terms to browse everything and
+        get_term for full detail. Matching is lexical, not semantic: use the schema's vocabulary, try
+        synonyms and translate. Read-only."""
         return svc.search_ontology(query, list(kinds) if kinds else None, limit, datasource)
 
     @tool(READ)
@@ -636,7 +685,10 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
             "1. search_ontology(datasource='knowledge') for the things involved; reuse existing Terms.\n"
             "2. Facts to count or compare: define_entity if needed, then add_records with source and _evidence.\n"
             "3. Ideas and explanations: save_concept with a definition, a body and typed relations, with the source.\n"
-            "4. Tell me what you stored, what you were unsure about, and anything you left out.\n\n"
+            "4. Documents (articles, papers, notes): keep the full text as the original in Obsidian (source.original, "
+            "original_text or original_file) and save_passages for the excerpts and section summaries worth finding "
+            "again, each with its heading or locator and the Terms it is about.\n"
+            "5. Tell me what you stored, what you were unsure about, and anything you left out.\n\n"
             + guidance.KNOWLEDGE_RULES
         )
 

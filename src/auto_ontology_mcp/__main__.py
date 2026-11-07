@@ -87,18 +87,37 @@ def cmd_serve(args: argparse.Namespace) -> None:
 
 def cmd_demo(args: argparse.Namespace) -> None:
     from .demo import build_demo_database
+    from .demo_knowledge import remove_demo_knowledge, seed_demo_knowledge
 
     settings = _settings()
+    svc = _service()
+    if args.remove:
+        out: dict = {"knowledge": remove_demo_knowledge(svc)}
+        ds = svc.store.datasource_by_name("demo")
+        if ds is not None:
+            with svc.store.tx() as con:
+                con.execute("DELETE FROM datasource WHERE id = ?", (ds["id"],))
+            out["datasource"] = "removed demo and its ontology"
+        _print(out)
+        return
+
     path = Path(args.path).expanduser() if args.path else settings.home / "demo_retail.sqlite"
     build_demo_database(path)
-    svc = _service()
-    result = svc.add_datasource("demo", f"sqlite:///{path}", description="Synthetic retail sales database (orders, customers, products).", scan=True)
+    result = {"structured": svc.add_datasource("demo", f"sqlite:///{path}", description="Synthetic retail sales database (orders, customers, products).", scan=True)}
+    if not args.no_knowledge:
+        result["unstructured"] = seed_demo_knowledge(svc)
     _print(result)
-    print(
-        f"\nDemo database: {path}\nOntology store: {settings.store_path}\n"
-        "Connect a client (see README) and ask it to build the ontology, e.g. use the 'build_ontology' prompt.",
-        file=sys.stderr,
-    )
+    lines = [
+        "",
+        f"Structured demo:   datasource 'demo' ({path}). Ask your assistant to build its ontology (the 'build_ontology' prompt), then ask questions.",
+    ]
+    if not args.no_knowledge:
+        lines += [
+            f"Unstructured demo: three fictional documents in the 'knowledge' store; originals in {svc.knowledge.originals_dir}.",
+            "Combined demo:     ask why Midwest revenue fell in 2024; the numbers come from 'demo', the reasons from 'knowledge'.",
+            "Remove everything the demo added with: auto-ontology-mcp demo --remove",
+        ]
+    print("\n".join(lines), file=sys.stderr)
 
 
 def cmd_add(args: argparse.Namespace) -> None:
@@ -181,8 +200,10 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--datasource", action="append", metavar="NAME=URL", help="register (and scan) a datasource at startup")
     p.set_defaults(func=cmd_serve)
 
-    p = sub.add_parser("demo", help="create the sample retail database and register it as 'demo'")
-    p.add_argument("--path", default=None)
+    p = sub.add_parser("demo", help="set up the demos: the retail database 'demo' and three documents in the knowledge store")
+    p.add_argument("--path", default=None, help="where to write the demo database")
+    p.add_argument("--no-knowledge", action="store_true", help="only the structured demo (the retail database)")
+    p.add_argument("--remove", action="store_true", help="remove the demo database registration and the demo documents")
     p.set_defaults(func=cmd_demo)
 
     p = sub.add_parser("add", help="register a datasource and scan it")
