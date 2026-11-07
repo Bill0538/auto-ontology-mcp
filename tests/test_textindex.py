@@ -262,6 +262,8 @@ def test_existing_store_is_upgraded(settings):
     svc = OntologyService(settings)
     svc.knowledge.define_entity("Book", [{"name": "title", "type": "text"}])
     con = sqlite3.connect(svc.knowledge.path)
+    for (trigger,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+        con.execute(f"DROP TRIGGER {trigger}")
     for table in ("passages_fts", "terms_fts", "sources_fts", "passage_terms", "passages", "term_sources", "term_relations", "terms"):
         con.execute(f"DROP TABLE {table}")
     con.execute("ALTER TABLE sources DROP COLUMN original")
@@ -274,6 +276,42 @@ def test_existing_store_is_upgraded(settings):
     fresh.knowledge.save_passages([{"text": "Chapter one is about habits."}], source={"title": "Atomic Habits", "kind": "book"})
     assert fresh.knowledge.search_text("habits")["hits"]
     assert {"Source Passage", "Ontology Term", "Passage Search Index"} <= {t["name"] for t in fresh.store.terms(fresh.ds("knowledge")["id"])}
+
+
+def test_store_without_triggers_is_reindexed_once(kb, settings):
+    """A store written before the FTS triggers (0.3.x) gets reindexed once, then updates row by row."""
+    con = sqlite3.connect(kb.knowledge.path)
+    for (trigger,) in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'").fetchall():
+        con.execute(f"DROP TRIGGER {trigger}")
+    con.execute("DELETE FROM passages_fts")
+    con.execute("INSERT INTO passages_fts (rowid, passage_id, source_id, heading, text) VALUES (99, 1, 1, 'stale', 'stale row')")
+    con.commit()
+    con.close()
+
+    fresh = OntologyService(settings)
+    assert [h["passage_id"] for h in fresh.knowledge.search_text("에빙하우스", kinds=["passage"])["hits"]] == [1]
+    con = sqlite3.connect(fresh.knowledge.path)
+    assert con.execute("SELECT COUNT(*) FROM passages_fts WHERE rowid <> passage_id").fetchone()[0] == 0
+    assert con.execute("SELECT COUNT(*) FROM passages_fts").fetchone()[0] == 3
+    con.close()
+
+
+def test_index_follows_each_write(kb):
+    k = kb.knowledge
+    out = k.save_passages([{"text": "Interleaving mixes problem types.", "terms": ["Interleaving"]}],
+                          source={"title": "Make It Stick", "kind": "book", "summary": "Learning science for students."})
+    pid = out["inserted"][0]
+    assert k.search_text("interleaving", kinds=["passage"])["hits"][0]["passage_id"] == pid
+    k.save_passages([{"id": pid, "text": "Mixing problem types beats blocked practice."}])
+    assert not k.search_text("interleaving", kinds=["passage"])["hits"]
+    assert k.search_text("blocked practice", kinds=["passage"])["hits"][0]["passage_id"] == pid
+    assert k.search_text("students", kinds=["source"])["hits"][0]["title"] == "Make It Stick"
+    k.save_concept("Interleaving", "Practising different kinds of problems in one session.")
+    assert k.search_text("session", kinds=["term"])["hits"][0]["name"] == "Interleaving"
+    kb.update_term("Interleaving", name="Interleaved Practice", datasource="knowledge")
+    assert k.search_text("interleaved", kinds=["term"])["hits"][0]["name"] == "Interleaved Practice"
+    k.save_passages(delete_ids=[pid])
+    assert not k.search_text("blocked practice", kinds=["passage"])["hits"]
 
 
 async def test_passage_tools_over_mcp(settings):

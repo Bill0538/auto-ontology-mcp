@@ -111,6 +111,31 @@ def test_validate_catches_fan_out(modeled):
     assert any(w.startswith("Fan-out") for w in result["warnings"])
 
 
+@pytest.mark.parametrize(
+    ("aggregate", "fans_out"),
+    [
+        # The one side only decides which lines count; the summed value is per line.
+        ("SUM(CASE WHEN o.order_date < '2024-01-01' THEN l.line_total END)", False),
+        ("SUM(IIF(o.status = 'Delivered', l.line_total, 0))", False),
+        # A value computed per line from both sides (line cost) is at the line grain.
+        ("SUM(l.quantity * p.unit_cost)", False),
+        ("SUM(ABS(l.unit_price - p.unit_price) > 0.001)", False),
+        # Summing or counting the one side across its lines double counts.
+        ("SUM(p.unit_price)", True),
+        ("AVG(CASE WHEN o.status = 'Delivered' THEN p.unit_cost END)", True),
+        ("SUM(CASE WHEN o.status = 'Returned' THEN 1 ELSE 0 END)", True),
+        ("COUNT(o.order_id)", True),
+    ],
+)
+def test_fan_out_looks_at_what_is_aggregated(modeled, aggregate, fans_out):
+    sql = (
+        f"SELECT {aggregate} AS v FROM order_lines l JOIN orders o ON o.order_id = l.order_id "
+        "JOIN products p ON p.product_id = l.product_id"
+    )
+    warnings = modeled.validate_sql(sql)["warnings"]
+    assert any(w.startswith("Fan-out") for w in warnings) is fans_out, warnings
+
+
 def test_run_sql_returns_rows_grounding_and_logs(modeled):
     sql = (
         "SELECT s.state_name, ROUND(SUM(l.line_total), 2) AS revenue FROM order_lines l "

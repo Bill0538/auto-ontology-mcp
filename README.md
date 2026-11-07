@@ -52,7 +52,7 @@ Text-to-SQL fails quietly. The query runs, a number comes back, and nothing says
 
 ### 1. Structured data: the retail database
 
-A question asked after the tables were modeled:
+A question asked after the model modeled the tables and reviewed the joins. In that review it made `customers.delivery_city_id` the default city role, so states below are delivery states. A fresh scan makes `billing_city_id` the default instead: neither column name is the unqualified `city_id`, and Auto Ontology's fallback then picks the alphabetically first role. `set_relationship(..., is_default=true)` changes it, and `get_query_context` names the other role in its role notes either way.
 
 ```text
 You     What was revenue for the sushi roll flash drive in Pennsylvania in June 2024?
@@ -193,7 +193,7 @@ Remove everything the demo added to the knowledge store and the vault with `auto
 | **Modeling with your model** | Hands the model one table at a time with samples, keys and the modeling rules from Auto Ontology, then validates and stores the Terms and column mappings it proposes |
 | **SQL attributes** | Mines reusable filters, measures and join patterns from executed and verified queries and bridge tables, runs each candidate against the database before saving it |
 | **Answerability** | Matches the question's entities to Terms, attributes, SQL attributes and glossary entries, and to names stored in the data (products, places, statuses) |
-| **Validation** | Unknown columns (with the ontology's name for them), joins the ontology does not know, near-miss literals, percent-vs-fraction thresholds, one-to-many fan-out, and a dry run |
+| **Validation** | Unknown columns (with the ontology's name for them), joins the ontology does not know, near-miss literals, percent-vs-fraction thresholds, one-to-many fan-out, and a dry run. Fan-out is judged on what is aggregated: `SUM(products.unit_price)` over order lines is flagged, while `SUM(order_lines.quantity * products.unit_cost)` or a `CASE WHEN orders.… THEN order_lines.line_total END` is not, because the value is computed per order line |
 | **Governance** | Draft, certified and deprecated status on Terms and SQL attributes; editing a certified definition returns it to draft. Verified question and SQL pairs feed later answers |
 | **Knowledge store** | A writable store for what your assistant reads: entities with typed columns and references, concepts with a markdown body and typed relations, passages (excerpts and section summaries), and a source with locator and quote behind every record. An index, a change log and an Obsidian export make it usable as an LLM Wiki |
 | **Full-text search** | FTS5 indexes over passages, Term bodies and sources, ranked with bm25. Prefix matching finds words with Korean particles attached (기억 → 기억을), and a substring pass finds them inside compounds. `search_text` returns snippets, headings and `[[links]]` to the originals |
@@ -216,6 +216,8 @@ You need [uv](https://docs.astral.sh/uv/getting-started/installation/).
 ```bash
 uvx --from git+https://github.com/gogoymh/auto-ontology-mcp auto-ontology-mcp demo
 ```
+
+`uvx` caches what it installs from GitHub. To move to a newer version, run any command once with `--refresh`, for example `uvx --refresh --from git+https://github.com/gogoymh/auto-ontology-mcp auto-ontology-mcp --version`, then restart your client. A store created by an earlier version is upgraded the first time the new version opens it.
 
 **2. Connect your client.** One click for Cursor or VS Code (both need [uv](https://docs.astral.sh/uv/getting-started/installation/) installed):
 
@@ -418,6 +420,8 @@ ORDER BY bm25(passages_fts);
 ```
 
 `validate_sql` knows these tables, their joins and the FTS functions, so these queries get the same checks as any other. The Term tables mirror the ontology and are read-only; change Terms through `save_concept`, `define_entity` and `update_term`.
+
+The indexes follow each write row by row: triggers reindex the passages and sources that changed, and only Terms that changed are copied to the mirror. A write therefore costs about the same in a large store as in a small one. With 20,000 passages, adding a record took about 20 ms and saving a passage about 40 ms (Apple M4 Pro, median of five writes).
 
 ### A session
 

@@ -259,8 +259,13 @@ class Validator:
             if agg["distinct"] or not agg["columns"]:
                 continue
             scope = {(s.casefold(), t.casefold()) for s, t in agg["scope_tables"]}
-            for col in agg["columns"]:
+            # What is summed or averaged; with only constants (COUNT(CASE WHEN … THEN 1 END)) the
+            # condition columns decide which rows are counted, so they stand in for the value.
+            values = agg.get("value_columns") or agg["columns"]
+            for col in values:
                 for one_side, many_side in fanned:
+                    if any(v.table.casefold() == many_side[1].casefold() for v in values):
+                        continue  # the value is computed per row of the many side (qty * unit_cost): no fan-out
                     one_key = (one_side[0].casefold(), one_side[1].casefold())
                     many_key = (many_side[0].casefold(), many_side[1].casefold())
                     same_table = col.table.casefold() == one_side[1].casefold() and (

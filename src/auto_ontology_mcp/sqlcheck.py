@@ -422,11 +422,16 @@ def analyze(sql_or_tree: str | exp.Expression, columns: list[dict[str, Any]], di
                 distinct = False
             cols = [] if arg is None else list(arg.find_all(exp.Column))
             physical = [p for p in (_trace(scope, c) for c in cols) if p]
+            # Columns that only decide whether a row counts (CASE WHEN / IIF conditions) are not
+            # aggregated themselves: SUM(CASE WHEN orders.day < x THEN lines.total END) sums lines.total.
+            in_condition = {id(c) for cond in ([] if arg is None else arg.find_all(exp.If)) for c in cond.this.find_all(exp.Column)}
+            values = [p for p in (_trace(scope, c) for c in cols if id(c) not in in_condition) if p]
             analysis.aggregates.append(
                 {
                     "function": type(agg).__name__.upper(),
                     "distinct": distinct,
                     "columns": physical,
+                    "value_columns": values,
                     "sql": agg.sql(dialect=dialect),
                     "scope_tables": [
                         (s.db or "", s.name) for s in scope.sources.values() if isinstance(s, exp.Table)

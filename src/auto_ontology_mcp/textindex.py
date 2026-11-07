@@ -7,9 +7,10 @@ combine them with records and sources in one query:
   in the Obsidian vault), each linked to the Terms it is about;
 - a mirror of the knowledge store's Terms, typed relations and Term sources
   (``terms``, ``term_relations``, ``term_sources``). The ontology store stays
-  the source of truth; the mirror is rebuilt whenever its changelog moves, so
-  SQL (including ``WITH RECURSIVE``) can walk the concept graph;
-- FTS5 indexes over passages, Terms and sources, ranked with bm25.
+  the source of truth; when its changelog moves, the rows that differ are
+  copied over, so SQL (including ``WITH RECURSIVE``) can walk the concept graph;
+- FTS5 indexes over passages, Terms and sources, ranked with bm25 and kept up
+  to date by triggers, one row at a time.
 
 The tokenizer is ``unicode61`` with prefix queries rather than ``trigram``:
 trigram cannot match words shorter than three characters, which rules out most
@@ -115,6 +116,41 @@ FTS_DDL = (
     f"CREATE VIRTUAL TABLE IF NOT EXISTS {SOURCES_FTS} USING fts5("
     f"source_id UNINDEXED, title, summary, content, tokenize = '{TOKENIZER}')",
 )
+INDEX_DDL = (
+    f"CREATE INDEX IF NOT EXISTS {PASSAGES}_source ON {PASSAGES} (source_id)",
+    f"CREATE INDEX IF NOT EXISTS {PASSAGE_TERMS}_term ON {PASSAGE_TERMS} (term_id)",
+)
+
+
+# (FTS table, base table, base column -> FTS column pairs). The base key is copied into an
+# UNINDEXED column so SQL can join on it.
+FTS_SOURCES = (
+    (PASSAGES_FTS, PASSAGES, (("id", "passage_id"), ("source_id", "source_id"), ("heading", "heading"), ("text", "text"))),
+    (TERMS_FTS, TERMS, (("id", "term_id"), ("name", "name"), ("synonyms", "synonyms"), ("description", "description"), ("body", "body"))),
+    (SOURCES_FTS, "sources", (("id", "source_id"), ("title", "title"), ("summary", "summary"), ("content", "content"))),
+)
+FTS_TRIGGER_NAMES = tuple(f"{fts}_{op}" for fts, _, _ in FTS_SOURCES for op in ("ai", "ad", "au"))
+
+
+def _trigger_ddl() -> tuple[str, ...]:
+    out: list[str] = []
+    for fts, base, pairs in FTS_SOURCES:
+        # Trigger bodies read new.<base column>; name the FTS columns explicitly.
+        cols = ", ".join(f for _, f in pairs)
+        new = ", ".join(f"new.{b}" for b, _ in pairs)
+        insert = f"INSERT INTO {fts} (rowid, {cols}) VALUES (new.rowid, {new});"
+        watched = ", ".join(b for b, _ in pairs if b != "id")
+        out += [
+            f"CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {base} BEGIN {insert} END",
+            f"CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {base} BEGIN DELETE FROM {fts} WHERE rowid = old.rowid; END",
+            f"CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE OF {watched} ON {base} BEGIN "
+            f"DELETE FROM {fts} WHERE rowid = old.rowid; {insert} END",
+        ]
+    return tuple(out)
+
+
+TRIGGERS_DDL = _trigger_ddl()
+
 # FTS key columns point at their base tables; FTS5 tables cannot declare foreign keys.
 FTS_KEYS = (
     (PASSAGES_FTS, "passage_id", PASSAGES, "id"),
@@ -291,6 +327,32 @@ def _snippet(text: str, words: list[str], width: int = 70) -> str:
     return ("…" if start else "") + piece + ("…" if start + width * 2 < len(text) else "")
 
 
+def _apply_diff(
+    con: sqlite3.Connection, table: str, keys: tuple[str, ...], columns: tuple[str, ...], wanted: dict[tuple, tuple]
+) -> list[tuple]:
+    """Make *table* hold exactly *wanted* ({key tuple: value tuple}), writing only rows that differ.
+
+    Returns the keys it deleted.
+    """
+    have = {
+        tuple(r[: len(keys)]): tuple(r[len(keys):])
+        for r in con.execute(f"SELECT {', '.join(keys + columns)} FROM {table}")
+    }
+    gone = [k for k in have if k not in wanted]
+    where = " AND ".join(f"{k} = ?" for k in keys)
+    if gone:
+        con.executemany(f"DELETE FROM {table} WHERE {where}", gone)
+    changed = [k + v for k, v in wanted.items() if have.get(k) != v]
+    if changed:
+        sets = ", ".join(f"{c} = excluded.{c}" for c in columns)
+        con.executemany(
+            f"INSERT INTO {table} ({', '.join(keys + columns)}) VALUES ({', '.join('?' for _ in keys + columns)}) "
+            f"ON CONFLICT ({', '.join(keys)}) DO UPDATE SET {sets}",
+            changed,
+        )
+    return gone
+
+
 class TextIndex:
     """Passages, the Term mirror and the FTS indexes of the knowledge store."""
 
@@ -324,11 +386,17 @@ class TextIndex:
             source_cols = {r[1] for r in con.execute(f"PRAGMA table_info({SOURCES_TABLE})")}
             if "original" not in source_cols:
                 con.execute(f"ALTER TABLE {SOURCES_TABLE} ADD COLUMN original TEXT")
-            for ddl in TABLES_DDL:
+            for ddl in TABLES_DDL + INDEX_DDL:
                 con.execute(ddl)
             if self.fts_available():
                 for ddl in FTS_DDL:
                     con.execute(ddl)
+                triggers = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")}
+                if not set(FTS_TRIGGER_NAMES) <= triggers:
+                    # New store, or one from before the triggers: index everything once, then row by row.
+                    for ddl in TRIGGERS_DDL:
+                        con.execute(ddl)
+                    self._rebuild_fts(con)
             after = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         names = {t["name"] for t in self.store.terms(ds["id"])}
         missing = [table for table, b in BUILTINS.items() if b["name"] not in names and table in after]
@@ -376,7 +444,11 @@ class TextIndex:
 
     # -------------------------------------------------------------- sync
     def sync(self, force: bool = False) -> None:
-        """Rebuild the Term mirror and the FTS indexes when the ontology changed since the last sync."""
+        """Bring the Term mirror up to date when the ontology changed since the last sync.
+
+        Only rows that differ are written; the FTS triggers then reindex just those rows. Passages
+        and sources live in this file, so their indexes follow every write through the triggers.
+        """
         ds = self.k.ds(create=False)
         if ds is None or not self.k.path.exists():
             return
@@ -385,25 +457,24 @@ class TextIndex:
         with self.k._write(foreign_keys=False) as con:
             if not force and con.execute("PRAGMA user_version").fetchone()[0] == seq:
                 return
-            self._rebuild(con, ds)
+            self._sync_mirror(con, ds)
             con.execute(f"PRAGMA user_version = {seq}")
 
-    def _rebuild(self, con: sqlite3.Connection, ds: dict[str, Any]) -> None:
-        from .knowledge import SOURCES_TABLE, is_builtin  # noqa: PLC0415
+    def _sync_mirror(self, con: sqlite3.Connection, ds: dict[str, Any]) -> None:
+        from .knowledge import is_builtin  # noqa: PLC0415 (circular import)
 
-        terms = [t for t in self.store.terms(ds["id"]) if not is_builtin(t)]
-        ids = {t["id"] for t in terms}
-        for table in (TERM_SOURCES, TERM_RELATIONS, TERMS):
-            con.execute(f"DELETE FROM {table}")
-        con.executemany(
-            f"INSERT INTO {TERMS} (id, name, kind, status, description, synonyms, body, record_table, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            [
-                (t["id"], t["name"], t.get("kind") or "entity", t["status"], t.get("description") or None,
-                 ", ".join(t.get("synonyms") or []) or None, t.get("body") or None,
-                 (t.get("spec") or {}).get("table"), t.get("updated_at"))
-                for t in terms
-            ],
+        terms = {
+            t["id"]: (t["name"], t.get("kind") or "entity", t["status"], t.get("description") or None,
+                      ", ".join(t.get("synonyms") or []) or None, t.get("body") or None,
+                      (t.get("spec") or {}).get("table"), t.get("updated_at"))
+            for t in self.store.terms(ds["id"]) if not is_builtin(t)
+        }
+        gone = _apply_diff(
+            con, TERMS, ("id",), ("name", "kind", "status", "description", "synonyms", "body", "record_table", "updated_at"),
+            {(i,): row for i, row in terms.items()},
         )
+        if gone:
+            con.executemany(f"DELETE FROM {PASSAGE_TERMS} WHERE term_id = ?", gone)
         rels = self.store.all(
             """
             SELECT r.*, s.name AS from_name, t.name AS to_name FROM term_relation r
@@ -412,31 +483,31 @@ class TextIndex:
             """,
             (ds["id"],),
         )
-        con.executemany(
-            f"""INSERT INTO {TERM_RELATIONS} (id, from_term_id, from_term, relation, to_term_id, to_term, description, source_id, evidence, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            [
-                (r["id"], r["source_term_id"], r["from_name"], r["relation"], r["target_term_id"], r["to_name"],
-                 r.get("description"), r.get("source_id"), r.get("evidence"), r.get("created_at"))
-                for r in rels if r["source_term_id"] in ids and r["target_term_id"] in ids
-            ],
+        _apply_diff(
+            con, TERM_RELATIONS, ("id",),
+            ("from_term_id", "from_term", "relation", "to_term_id", "to_term", "description", "source_id", "evidence", "created_at"),
+            {
+                (r["id"],): (r["source_term_id"], r["from_name"], r["relation"], r["target_term_id"], r["to_name"],
+                             r.get("description"), r.get("source_id"), r.get("evidence"), r.get("created_at"))
+                for r in rels if r["source_term_id"] in terms and r["target_term_id"] in terms
+            },
         )
         links = self.store.all(
             "SELECT ts.*, t.name AS term_name FROM term_source ts JOIN term t ON t.id = ts.term_id WHERE t.datasource_id = ?",
             (ds["id"],),
         )
-        con.executemany(
-            f"INSERT INTO {TERM_SOURCES} (term_id, term, source_id, locator, evidence) VALUES (?, ?, ?, ?, ?)",
-            [(lk["term_id"], lk["term_name"], lk["source_id"], lk.get("locator"), lk.get("evidence")) for lk in links if lk["term_id"] in ids],
+        _apply_diff(
+            con, TERM_SOURCES, ("term_id", "source_id"), ("term", "locator", "evidence"),
+            {(lk["term_id"], lk["source_id"]): (lk["term_name"], lk.get("locator"), lk.get("evidence")) for lk in links if lk["term_id"] in terms},
         )
-        con.execute(f"DELETE FROM {PASSAGE_TERMS} WHERE term_id NOT IN (SELECT id FROM {TERMS})")
-        if self.fts_available():
-            con.execute(f"DELETE FROM {TERMS_FTS}")
-            con.execute(f"INSERT INTO {TERMS_FTS} (term_id, name, synonyms, description, body) SELECT id, name, synonyms, description, body FROM {TERMS}")
-            con.execute(f"DELETE FROM {SOURCES_FTS}")
-            con.execute(f"INSERT INTO {SOURCES_FTS} (source_id, title, summary, content) SELECT id, title, summary, content FROM {SOURCES_TABLE}")
-            con.execute(f"DELETE FROM {PASSAGES_FTS}")
-            con.execute(f"INSERT INTO {PASSAGES_FTS} (passage_id, source_id, heading, text) SELECT id, source_id, heading, text FROM {PASSAGES}")
+
+    def _rebuild_fts(self, con: sqlite3.Connection) -> None:
+        """Reindex every row (a new store, or one written before the FTS triggers existed)."""
+        for fts, base, pairs in FTS_SOURCES:
+            con.execute(f"DELETE FROM {fts}")
+            con.execute(
+                f"INSERT INTO {fts} (rowid, {', '.join(f for _, f in pairs)}) SELECT rowid, {', '.join(b for b, _ in pairs)} FROM {base}"
+            )
 
     # ---------------------------------------------------------- passages
     def save_passages(
@@ -681,14 +752,15 @@ class TextIndex:
                 for r in rows:
                     seen.add(r["id"])
                     hits.append(self._passage_hit(r, r["snip"], -r["rank"], "words"))
-            cond, lparams = like(["p.text", "COALESCE(p.heading, '')"])
-            rows = con.execute(
-                base + f""" FROM {PASSAGES} p JOIN sources s ON s.id = p.source_id WHERE {cond}{extra} ORDER BY p.id DESC LIMIT ?""",
-                (*lparams, *fparams, limit * 2),
-            ).fetchall()
-            for r in rows:
-                if r["id"] not in seen:
-                    hits.append(self._passage_hit(r, _snippet(r["text"], words), 0.0, "substring"))
+            if len(seen) < limit:  # substrings inside compounds; skipped when whole words already fill the page
+                cond, lparams = like(["p.text", "COALESCE(p.heading, '')"])
+                rows = con.execute(
+                    base + f""" FROM {PASSAGES} p JOIN sources s ON s.id = p.source_id WHERE {cond}{extra} ORDER BY p.id DESC LIMIT ?""",
+                    (*lparams, *fparams, limit * 2),
+                ).fetchall()
+                for r in rows:
+                    if r["id"] not in seen:
+                        hits.append(self._passage_hit(r, _snippet(r["text"], words), 0.0, "substring"))
 
         if "term" in kinds and source is None and term_id is None:
             seen_t: set[str] = set()
@@ -704,15 +776,16 @@ class TextIndex:
                 for r in rows:
                     seen_t.add(r["id"])
                     hits.append(self._term_hit(r, r["snip"], -r["rank"], "words"))
-            cond, lparams = like(["t.name", "COALESCE(t.synonyms, '')", "COALESCE(t.description, '')", "COALESCE(t.body, '')"])
-            rows = con.execute(
-                f"SELECT t.id, t.name, t.kind, t.status, t.description, t.body FROM {TERMS} t WHERE {cond}{filt} LIMIT ?",
-                (*lparams, *fparams, limit * 2),
-            ).fetchall()
-            for r in rows:
-                if r["id"] not in seen_t:
-                    text = " ".join(x for x in (r["description"], r["body"]) if x) or r["name"]
-                    hits.append(self._term_hit(r, _snippet(text, words), 0.0, "substring"))
+            if len(seen_t) < limit:
+                cond, lparams = like(["t.name", "COALESCE(t.synonyms, '')", "COALESCE(t.description, '')", "COALESCE(t.body, '')"])
+                rows = con.execute(
+                    f"SELECT t.id, t.name, t.kind, t.status, t.description, t.body FROM {TERMS} t WHERE {cond}{filt} LIMIT ?",
+                    (*lparams, *fparams, limit * 2),
+                ).fetchall()
+                for r in rows:
+                    if r["id"] not in seen_t:
+                        text = " ".join(x for x in (r["description"], r["body"]) if x) or r["name"]
+                        hits.append(self._term_hit(r, _snippet(text, words), 0.0, "substring"))
 
         if "source" in kinds and term_id is None:
             seen_s: set[int] = set()
@@ -729,15 +802,16 @@ class TextIndex:
                 for r in rows:
                     seen_s.add(r["id"])
                     hits.append(self._source_hit(r, r["snip"], -r["rank"], "words"))
-            cond, lparams = like(["s.title", "COALESCE(s.summary, '')", "COALESCE(s.content, '')"])
-            rows = con.execute(
-                f"SELECT s.id, s.title, s.kind, s.original, s.summary, s.content FROM sources s WHERE {cond}{filt} LIMIT ?",
-                (*lparams, *fparams, limit * 2),
-            ).fetchall()
-            for r in rows:
-                if r["id"] not in seen_s:
-                    text = " ".join(x for x in (r["summary"], r["content"]) if x) or r["title"]
-                    hits.append(self._source_hit(r, _snippet(text, words), 0.0, "substring"))
+            if len(seen_s) < limit:
+                cond, lparams = like(["s.title", "COALESCE(s.summary, '')", "COALESCE(s.content, '')"])
+                rows = con.execute(
+                    f"SELECT s.id, s.title, s.kind, s.original, s.summary, s.content FROM sources s WHERE {cond}{filt} LIMIT ?",
+                    (*lparams, *fparams, limit * 2),
+                ).fetchall()
+                for r in rows:
+                    if r["id"] not in seen_s:
+                        text = " ".join(x for x in (r["summary"], r["content"]) if x) or r["title"]
+                        hits.append(self._source_hit(r, _snippet(text, words), 0.0, "substring"))
         return hits
 
     @staticmethod
