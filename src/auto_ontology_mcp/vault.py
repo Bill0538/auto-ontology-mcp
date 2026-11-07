@@ -6,11 +6,14 @@ source points at its original by a vault-relative path (``sources.original``).
 The original is either a note already in the vault, markdown text the model
 transcribed (written as a new note), or a local file copied in (a PDF, an
 image). Existing files are never overwritten: a different original with the
-same name gets a numbered name instead.
+same name gets a numbered name instead, so when a document changes its new
+version becomes a new note and the old one stays where the user may have
+annotated it.
 """
 
 from __future__ import annotations
 
+import hashlib
 import re
 import shutil
 from datetime import UTC, datetime
@@ -49,7 +52,7 @@ def wikilink(path: str, heading: str | None = None, label: str | None = None) ->
     return f"[[{target}|{label}]]" if label else f"[[{target}]]"
 
 
-def _inside(path: Path, root: Path) -> bool:
+def inside(path: Path, root: Path) -> bool:
     try:
         path.relative_to(root)
         return True
@@ -66,20 +69,38 @@ def _free_name(folder: Path, stem: str, suffix: str, same: Any) -> Path:
     raise KnowledgeError(f"Too many originals named {stem!r}; pick another title.")
 
 
-def _note_body(path: Path) -> str:
+def _digest(body: str) -> str:
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _read_note(path: Path) -> tuple[dict[str, Any], str]:
+    """Frontmatter and body of a markdown note."""
     text = path.read_text(encoding="utf-8", errors="replace")
     if text.startswith("---\n"):
         end = text.find("\n---\n", 4)
         if end != -1:
-            return text[end + 5:].lstrip("\n")
-    return text
+            try:
+                meta = yaml.safe_load(text[4:end]) or {}
+            except yaml.YAMLError:
+                meta = {}
+            return (meta if isinstance(meta, dict) else {}), text[end + 5:].lstrip("\n")
+    return {}, text
+
+
+def _same_note(path: Path, body: str) -> bool:
+    """Whether the note holds this text: the hash written with it (so the user's own edits in
+    Obsidian do not count as a different original), else the body itself."""
+    meta, current = _read_note(path)
+    if meta.get("sha256"):
+        return meta["sha256"] == _digest(body)
+    return current.strip() == body
 
 
 def link_existing(vault: Path, original: str) -> str:
     """Validate a note or file that is already in the vault; returns its vault-relative path."""
     raw = Path(original).expanduser()
     path = (raw if raw.is_absolute() else vault / raw).resolve()
-    if not _inside(path, vault.resolve()):
+    if not inside(path, vault.resolve()):
         raise KnowledgeError(f"original {original!r} is outside the Obsidian vault ({vault}).")
     if not path.is_file():
         raise KnowledgeError(f"original {original!r} does not exist in the vault ({vault}).")
@@ -94,7 +115,7 @@ def write_text(vault: Path, folder: Path, source: dict[str, Any], text: str) -> 
     folder.mkdir(parents=True, exist_ok=True)
     title = source.get("title") or "untitled"
     stem = safe_filename(title[:-3] if title.lower().endswith(".md") else title)
-    path = _free_name(folder, stem, ".md", lambda p: _note_body(p).strip() == body)
+    path = _free_name(folder, stem, ".md", lambda p: _same_note(p, body))
     if not path.exists():
         meta = {
             "title": title,
@@ -105,6 +126,7 @@ def write_text(vault: Path, folder: Path, source: dict[str, Any], text: str) -> 
             "published_on": source.get("published_on"),
             "saved_at": datetime.now(UTC).replace(microsecond=0).isoformat(),
             "saved_by": SAVED_BY,
+            "sha256": _digest(body),
         }
         head = yaml.safe_dump({k: v for k, v in meta.items() if v not in (None, "")}, allow_unicode=True, sort_keys=False)
         path.write_text(f"---\n{head}---\n\n{body}\n", encoding="utf-8")
@@ -131,7 +153,7 @@ def copy_file(vault: Path, folder: Path, file: str) -> str:
     size = path.stat().st_size
     if size > MAX_ORIGINAL_BYTES:
         raise KnowledgeError(f"original_file is {size // (1024 * 1024)} MB; the limit is {MAX_ORIGINAL_BYTES // (1024 * 1024)} MB.")
-    if _inside(path, vault.resolve()):
+    if inside(path, vault.resolve()):
         return path.relative_to(vault.resolve()).as_posix()
     folder.mkdir(parents=True, exist_ok=True)
     data = path.read_bytes()

@@ -126,11 +126,11 @@ class OntologyService:
             ok, err = self.connections.test(ds)
             tables = self.store.tables(ds["id"])
             terms = self.store.terms(ds["id"])
-            modeled = self._modeled_table_ids(ds)
+            gaps = self._modeling_gaps(ds)
+            modeled, remaining = gaps["modeled"], gaps["without_terms"]
+            changed = [t for t in tables if t["id"] in gaps["new_columns"]]
             rels = self.store.relationships(ds["id"], ("accepted", "proposed"))
             sql_attrs = self.store.sql_attributes_for_datasource(ds["id"])
-            fks = self._fk_columns(ds)
-            remaining = [t for t in tables if t["id"] not in modeled and self._candidate_columns(ds, t, fks)]
             if not ok:
                 verdict, step = "unreachable", f"Fix the connection ({err}); the catalog can still be read but no SQL can run."
             elif not tables:
@@ -139,6 +139,10 @@ class OntologyService:
                 verdict, step = "not_modeled", "Call get_modeling_worklist and save_table_terms for each table."
             elif remaining:
                 verdict, step = "partially_modeled", f"{len(remaining)} table(s) still have no Term; continue with get_modeling_worklist."
+            elif changed:
+                verdict, step = "partially_modeled", (
+                    f"{len(changed)} modeled table(s) have columns added since they were modeled; map them with get_modeling_worklist."
+                )
             else:
                 verdict, step = "ready", "Ask questions: check_answerable → get_query_context → validate_sql → run_sql."
             if ds["name"] == KNOWLEDGE_DS:
@@ -159,6 +163,7 @@ class OntologyService:
                     "tables": len(tables),
                     "modeled_tables": len(modeled),
                     "tables_without_terms": [t["name"] for t in remaining][:30],
+                    "tables_with_new_columns": [t["name"] for t in changed][:30],
                     "terms": {"total": len(terms), "certified": sum(t["status"] == "certified" for t in terms)},
                     "relationships": {
                         "accepted": sum(r["status"] == "accepted" for r in rels),
@@ -233,15 +238,17 @@ class OntologyService:
         ds = self.ds(datasource)
         summary = self.scanner.scan(ds, schemas=schemas, profile=profile)
         ds = self.ds(ds["name"])
-        modeled = self._modeled_table_ids(ds)
-        fks = self._fk_columns(ds)
-        summary["tables_without_terms"] = sum(
-            1 for t in self.store.tables(ds["id"]) if t["id"] not in modeled and self._candidate_columns(ds, t, fks)
+        gaps = self._modeling_gaps(ds)
+        names = {t["id"]: _label(t["schema_name"], t["name"]) for t in gaps["tables"]}
+        summary["tables_without_terms"] = len(gaps["without_terms"])
+        summary["new_columns_on_modeled_tables"] = {names[tid]: [c["name"] for c in cols] for tid, cols in gaps["new_columns"].items()}
+        model = "Model tables with get_modeling_worklist" + (
+            " (it also returns modeled tables that gained columns)." if gaps["new_columns"] else "."
         )
         summary["next_step"] = (
-            "Review proposed relationships with list_relationships, then model tables with get_modeling_worklist."
+            f"Review proposed relationships with list_relationships, then {model[0].lower()}{model[1:]}"
             if summary.get("relationships_proposed")
-            else "Model tables with get_modeling_worklist."
+            else model
         )
         return {"datasource": ds["name"], **summary}
 
@@ -262,6 +269,27 @@ class OntologyService:
         fk_names = {r["source_column"] for r in fks.get(table["id"], [])}
         return [c for c in self.store.columns(table["id"]) if c["name"] not in fk_names]
 
+    def _modeling_gaps(self, ds: dict[str, Any]) -> dict[str, Any]:
+        """Tables with no Term yet, and modeled tables with columns no Term maps (added since they were
+        modeled: save_table_terms maps every candidate column, so an unmapped one is new)."""
+        tables = self.store.tables(ds["id"])
+        modeled = self._modeled_table_ids(ds)
+        fks = self._fk_columns(ds)
+        knowledge = self.knowledge.is_knowledge(ds)  # entities map their own columns through define_entity
+        mapped = {a["column_id"] for a in self.store.attributes_for_datasource(ds["id"])}
+        without_terms, new_columns = [], {}
+        for t in tables:
+            cand = self._candidate_columns(ds, t, fks)
+            if not cand:
+                continue
+            if t["id"] not in modeled:
+                without_terms.append(t)
+            elif not knowledge:
+                unmapped = [c for c in cand if c["id"] not in mapped]
+                if unmapped:
+                    new_columns[t["id"]] = unmapped
+        return {"tables": tables, "modeled": modeled, "fks": fks, "without_terms": without_terms, "new_columns": new_columns}
+
     @staticmethod
     def _column_view(c: dict[str, Any]) -> dict[str, Any]:
         out: dict[str, Any] = {"column": c["name"], "type": c.get("data_type")}
@@ -281,11 +309,10 @@ class OntologyService:
 
     def get_modeling_worklist(self, datasource: str | None = None, limit: int = 3, tables: list[str] | None = None) -> dict[str, Any]:
         ds = self.ds(datasource)
-        all_tables = self.store.tables(ds["id"])
+        gaps = self._modeling_gaps(ds)
+        all_tables, fks, modeled, new_columns = gaps["tables"], gaps["fks"], gaps["modeled"], gaps["new_columns"]
         if not all_tables:
             raise OntologyError("The datasource has not been scanned yet. Call scan_datasource first.")
-        fks = self._fk_columns(ds)
-        modeled = self._modeled_table_ids(ds)
         terms = self.store.terms(ds["id"])
         term_by_table = defaultdict(list)
         for t in terms:
@@ -295,8 +322,8 @@ class OntologyService:
         if tables:
             todo = [self.table_ref(ds, ref) for ref in tables]
         else:
-            pending = [t for t in all_tables if t["id"] not in modeled and self._candidate_columns(ds, t, fks)]
-            pending.sort(key=lambda t: (len(fks.get(t["id"], [])), t["schema_name"], t["name"]))
+            pending = [*gaps["without_terms"], *(t for t in all_tables if t["id"] in new_columns)]
+            pending.sort(key=lambda t: (t["id"] in new_columns, len(fks.get(t["id"], [])), t["schema_name"], t["name"]))
             todo = pending[: max(1, min(limit, 10))]
         incoming = defaultdict(list)
         for r in self.store.relationships(ds["id"], ("accepted",)):
@@ -305,11 +332,31 @@ class OntologyService:
         bridge_only = [
             t["name"] for t in all_tables if t["id"] not in modeled and not self._candidate_columns(ds, t, fks)
         ]
+        mapping: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        if any(t["id"] in new_columns for t in todo):
+            for a in self.store.attributes_for_datasource(ds["id"]):
+                mapping[a["term_id"]].append(a)
         items = []
         for t in todo:
             cand = self._candidate_columns(ds, t, fks)
+            item: dict[str, Any] = {}
+            if t["id"] in new_columns:
+                item["new_columns"] = [c["name"] for c in new_columns[t["id"]]]
+                item["current_terms"] = [
+                    {
+                        "name": term["name"],
+                        "description": term.get("description"),
+                        "synonyms": term.get("synonyms") or [],
+                        "columns": [
+                            {"column": a["column_name"], "display_name": a["display_name"], **({"description": a["description"]} if a.get("description") else {})}
+                            for a in mapping[term["id"]] if a["table_id"] == t["id"]
+                        ],
+                    }
+                    for term in terms if term.get("primary_table_id") == t["id"]
+                ]
             items.append(
                 {
+                    **item,
                     "table": _label(t["schema_name"], t["name"]),
                     "table_type": t.get("table_type"),
                     "row_count": t.get("row_count"),
@@ -333,18 +380,23 @@ class OntologyService:
                     "existing_terms": term_by_table.get(t["id"], []),
                 }
             )
-        remaining = sum(1 for t in all_tables if t["id"] not in modeled and self._candidate_columns(ds, t, fks))
+        remaining = len(gaps["without_terms"]) + len(new_columns)
+        step = "For each table above call save_table_terms(table, terms=[...]). Then call get_modeling_worklist again."
+        if any("new_columns" in i for i in items):
+            step += (
+                " Tables with new_columns are already modeled: send their current_terms back with each new column"
+                " added to the Term it belongs to (a Term left out is removed, a column left out goes to the first Term)."
+            )
         return {
             "datasource": ds["name"],
             "instructions": guidance.TERM_RULES,
-            "progress": {"tables": len(all_tables), "modeled": len(modeled), "remaining": remaining},
+            "progress": {
+                "tables": len(all_tables), "modeled": len(modeled), "remaining": remaining,
+                "modeled_with_new_columns": len(new_columns),
+            },
             "tables": items,
             "tables_with_only_foreign_keys": bridge_only,
-            "next_step": (
-                "For each table above call save_table_terms(table, terms=[...]). Then call get_modeling_worklist again."
-                if items
-                else "Every table with candidate columns has Terms. Review relationships and SQL attributes next."
-            ),
+            "next_step": step if items else "Every table with candidate columns has Terms. Review relationships and SQL attributes next.",
         }
 
     def save_table_terms(
@@ -1178,6 +1230,8 @@ class OntologyService:
                 what = f"SQL attribute {d.get('term', '')} › {d.get('name', subject)}: {r['action']}"
             elif r["entity_type"] == "relationship":
                 what = f"relationship {d.get('source', '')} → {d.get('target', '')}: {r['action']}"
+            elif r["entity_type"] == "source" and r["action"] == "replace_original":
+                what = f"source {d.get('title') or subject}: new original {d.get('original')} (previous {d.get('previous')} kept)"
             else:
                 what = f"{r['entity_type'].replace('_', ' ')} {subject}: {r['action']}"
             changes.append({"at": r["at"], "what": what})

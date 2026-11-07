@@ -33,7 +33,9 @@ show the SQL, and mention truncation and any uncertified (draft) Terms you relie
 Building an ontology: add_datasource → scan_datasource → get_modeling_worklist / \
 save_table_terms until no tables remain → list_relationships / set_relationship to review \
 proposed joins → suggest_sql_attributes / save_sql_attribute → certify what a person approved \
-with update_term(status="certified").
+with update_term(status="certified"). After a schema change, scan_datasource again: Terms and \
+reviewed joins are kept, and get_modeling_worklist returns new tables and modeled tables that \
+gained columns (send their current_terms back with the new columns placed).
 
 Keeping personal knowledge (datasource "knowledge", created on first use): when the user shares \
 documents, images, notes or facts to remember, read them yourself and store what they contain. \
@@ -43,8 +45,11 @@ source); explanations, ideas and definitions go into concepts (save_concept) lin
 relations. Documents (articles, papers, meeting notes) keep their full text as the original in \
 the Obsidian vault (source.original for a note already there, original_text or original_file to \
 save one); the store keeps their summaries and excerpts as passages (save_passages), each with \
-its heading or locator and the Terms it is about. Every record, concept and passage should name \
-its source. Ask before deleting anything. list_terms is the index and recent_changes the log. For \
+its heading or locator and the Terms it is about. When a document changes, save its source again \
+(same uri or id) with the new original_text or original_file, which becomes a new note while the \
+old one stays, then save_passages(replace=true) with every passage of the new version and check \
+get_source for records and concepts that came from it. Every record, concept and passage should \
+name its source. Ask before deleting anything. list_terms is the index and recent_changes the log. For \
 "what is X / what do I know about X", answer from get_term (definition, body, relations, sources) \
 and search_text (passages); for totals, counts and comparisons, use SQL as for any datasource. \
 SQL also reads the concept graph and the text: terms, term_relations (walk chains with WITH \
@@ -182,7 +187,8 @@ _locator (page, timestamp, line) and _evidence (the quote or number as written).
 5. Documents: the full text belongs in the Obsidian vault as the source's original (original, \
 original_text or original_file), not in the store. Save what is worth finding again as passages: \
 one idea each, quotes as written or summaries of one section, with the heading or locator and the \
-Terms they are about.
+Terms they are about. When a document changed, read all of it again and call save_passages with \
+replace=true rather than adding a second set of passages.
 6. Never invent values. Leave unknown fields out; record ambiguity in _note.
 7. Certified means a person confirmed it. New knowledge is draft; do not certify on your own.
 """

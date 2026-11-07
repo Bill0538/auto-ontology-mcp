@@ -1,6 +1,6 @@
 [project]
 name = "auto-ontology-mcp"
-version = "0.4.0"
+version = "0.5.0"
 description = "NVIDIA Auto Ontology's semantic layer and a personal knowledge base as an MCP server for Claude, ChatGPT and other MCP clients. The client model is the LLM; no model API key needed."
 readme = "README.md"
 license = "Apache-2.0"

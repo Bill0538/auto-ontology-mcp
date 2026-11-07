@@ -68,8 +68,8 @@ class SourceInput(BaseModel):
     summary: str | None = Field(default=None, description="What the source is about, in a sentence or two.")
     content: str | None = Field(default=None, description="A short excerpt; save longer parts as passages and keep the full text as the original.")
     original: str | None = Field(default=None, description="Path of the original that is already in the Obsidian vault, relative to the vault, e.g. 'Clippings/Article.md'.")
-    original_text: str | None = Field(default=None, description="Full text (markdown) to keep as the original: written as a new note in the vault's originals folder. Use it for web pages, chats and transcriptions that exist nowhere else.")
-    original_file: str | None = Field(default=None, description="Absolute path of a local file (PDF, image, document) to copy into the vault as the original.")
+    original_text: str | None = Field(default=None, description="Full text (markdown) to keep as the original: written as a new note in the vault's originals folder. Use it for web pages, chats and transcriptions that exist nowhere else. When the document changed, pass the new text: it becomes a new note, the source points at it and the old note stays.")
+    original_file: str | None = Field(default=None, description="Absolute path of a local file (PDF, image, document) to copy into the vault as the original. A changed file is copied next to the old one, which stays.")
 
 
 class PassageInput(BaseModel):
@@ -177,7 +177,8 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
             confirmed by value containment. Use it after the schema changed or to refresh
             profiles; add_datasource already scans once. Terms, reviewed relationships and SQL
             attributes are kept; inferred relationships that lost their evidence are removed.
-            Reads the database only."""
+            Reports new tables and columns added to modeled tables; get_modeling_worklist returns
+            both. Reads the database only."""
             return svc.scan_datasource(datasource, schemas, profile)
 
     # ------------------------------------------------------------- modeling
@@ -190,8 +191,10 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
         """Return the next tables that still have no business Terms, with what you need to name them: candidate
         columns (types, samples, uniqueness, formats), foreign keys and the Terms they point to, and
         the modeling rules. Use it while building an ontology over a database; call save_table_terms
-        once per returned table and repeat until remaining is 0. For the personal knowledge store
-        use define_entity instead. Read-only."""
+        once per returned table and repeat until remaining is 0. After a re-scan it also returns
+        modeled tables that gained columns, with new_columns and current_terms: send current_terms
+        back with each new column added to its Term. For the personal knowledge store use
+        define_entity instead. Read-only."""
         return svc.get_modeling_worklist(datasource, limit, tables)
 
     @tool(WRITE)
@@ -406,17 +409,24 @@ def build_server(settings: Settings | None = None, service: OntologyService | No
         passages: Annotated[list[PassageInput] | None, Field(description="Excerpts or section summaries to save.")] = None,
         source: SourceArg = None,
         delete_ids: Annotated[list[int] | None, Field(description="Passage ids to delete (permanent; confirm with the user first).")] = None,
+        replace: Annotated[
+            bool,
+            Field(description="True when the source document changed and you read all of it again: passages is then its complete set, and its other passages are deleted (listed in deleted)."),
+        ] = False,
     ) -> dict[str, Any]:
         """Save excerpts and section summaries of one source (an article, paper, book chapter, meeting
         note) so they can be searched with search_text and cited, each with its heading or locator in
         the original and the Terms it is about. The full original stays in the Obsidian vault: point
         the source at a note already there (source.original), or pass source.original_text or
         source.original_file to keep it there. Keep one idea per passage. A passage with the same text
-        from the same source updates instead of duplicating; delete_ids removes passages. Use
-        add_records for countable facts and save_concept for definitions."""
+        from the same source updates instead of duplicating; delete_ids removes passages. When the
+        document changed, save the source again (same uri or id) with the new original and call this
+        with replace=true and every passage of the new version: unchanged passages keep their ids, and
+        get_source shows the records and concepts to check next. Use add_records for countable facts
+        and save_concept for definitions."""
         src = source.model_dump(exclude_none=True) if isinstance(source, SourceInput) else source
         items = [x.model_dump(exclude_none=True) for x in passages] if passages else None
-        return svc.knowledge.save_passages(items, src, delete_ids)
+        return svc.knowledge.save_passages(items, src, delete_ids, replace)
 
     @tool(READ, title="Full-text search")
     def search_text(

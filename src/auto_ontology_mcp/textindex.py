@@ -511,8 +511,14 @@ class TextIndex:
 
     # ---------------------------------------------------------- passages
     def save_passages(
-        self, passages: list[dict[str, Any]] | None, source: Any = None, delete_ids: list[int] | None = None
+        self, passages: list[dict[str, Any]] | None, source: Any = None, delete_ids: list[int] | None = None,
+        replace: bool = False,
     ) -> dict[str, Any]:
+        """Insert, update and delete passages of one source.
+
+        ``replace`` makes ``passages`` the source's complete set, for a document that changed and was
+        read again: its passages that the call neither repeats nor updates are deleted.
+        """
         from .knowledge import is_builtin  # noqa: PLC0415
 
         k = self.k
@@ -548,6 +554,10 @@ class TextIndex:
             prepared.append({**p, "text": text, "kind": kind, "terms": names})
         if passages and source is None and any(p.get("id") is None for p in prepared):
             problems.append("new passages need a source (an id or {title, kind, uri, original...})")
+        if replace and source is None:
+            problems.append("replace=true needs the source whose passages these are")
+        if replace and not passages:
+            problems.append("replace=true needs the source's current passages; delete_ids removes passages without replacing them")
         if problems:
             raise KnowledgeError("Nothing was saved. Fix these and call save_passages again:\n- " + "\n- ".join(problems[:40]))
 
@@ -584,9 +594,10 @@ class TextIndex:
 
         result: dict[str, list[int]] = {"inserted": [], "updated": [], "unchanged": [], "deleted": []}
         source_id = None
+        replaced: list[dict[str, Any]] = []
         with k._write() as con:
             if source is not None:
-                source_id = k._source_id(con, source)
+                source_id = k._source_id(con, source, replaced)
             if delete_ids:
                 marks = ",".join("?" for _ in delete_ids)
                 con.execute(f"DELETE FROM {PASSAGE_TERMS} WHERE passage_id IN ({marks})", delete_ids)
@@ -627,6 +638,14 @@ class TextIndex:
                     result["updated"].append(pid)
                 for n in p["terms"]:
                     con.execute(f"INSERT OR IGNORE INTO {PASSAGE_TERMS} (passage_id, term_id) VALUES (?, ?)", (pid, term_ids[n.casefold()]))
+            if replace:
+                kept = {*result["inserted"], *result["updated"], *result["unchanged"]}
+                stale = [r[0] for r in con.execute(f"SELECT id FROM {PASSAGES} WHERE source_id = ? ORDER BY id", (source_id,)) if r[0] not in kept]
+                if stale:
+                    marks = ",".join("?" for _ in stale)
+                    con.execute(f"DELETE FROM {PASSAGE_TERMS} WHERE passage_id IN ({marks})", stale)
+                    con.execute(f"DELETE FROM {PASSAGES} WHERE id IN ({marks})", stale)
+                    result["deleted"] = [*result["deleted"], *stale]
             original = None
             if source_id is not None:
                 row = con.execute("SELECT original FROM sources WHERE id = ?", (source_id,)).fetchone()
@@ -639,6 +658,7 @@ class TextIndex:
             **result,
             "source_id": source_id,
             "original": original,
+            **({"originals_replaced": replaced} if replaced else {}),
             "stub_concepts_created": stubs,
             "total_passages": total,
             "next_step": "Find them with search_text, or combine with SQL: passages_fts MATCH '\"word\"*' joined to passages and sources.",

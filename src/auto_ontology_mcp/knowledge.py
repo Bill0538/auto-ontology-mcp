@@ -547,7 +547,8 @@ class Knowledge:
         return {"deleted": term["name"], "records_deleted": rows}
 
     # ------------------------------------------------------------- sources
-    def _source_id(self, con: sqlite3.Connection, source: Any) -> int | None:
+    def _source_id(self, con: sqlite3.Connection, source: Any, replaced: list[dict[str, Any]] | None = None) -> int | None:
+        """Resolve or register a source. ``replaced`` collects originals that a changed document replaced."""
         if source is None:
             return None
         if isinstance(source, bool):
@@ -564,7 +565,7 @@ class Knowledge:
             if source.get("original"):
                 path = vault.link_existing(self.vault_root, str(source["original"]))
                 con.execute(f"UPDATE {SOURCES_TABLE} SET original = ? WHERE id = ?", (path, sid))
-            self._store_original(con, sid, source)
+            self._store_original(con, sid, source, replaced)
             return sid
         title = (source.get("title") or "").strip()
         if not title:
@@ -575,7 +576,7 @@ class Knowledge:
         if "original" in values:
             values["original"] = vault.link_existing(self.vault_root, str(values["original"]))
         sid = self._upsert_source(con, title, values)
-        self._store_original(con, sid, source)
+        self._store_original(con, sid, source, replaced)
         return sid
 
     def _upsert_source(self, con: sqlite3.Connection, title: str, values: dict[str, Any]) -> int:
@@ -599,22 +600,39 @@ class Knowledge:
         cur = con.execute(f"INSERT INTO {SOURCES_TABLE} ({cols}) VALUES ({', '.join('?' for _ in values)})", tuple(values.values()))
         return int(cur.lastrowid)
 
-    def _store_original(self, con: sqlite3.Connection, sid: int, source: dict[str, Any]) -> None:
+    def _store_original(
+        self, con: sqlite3.Connection, sid: int, source: dict[str, Any], replaced: list[dict[str, Any]] | None = None
+    ) -> None:
         """Keep the full original in the Obsidian vault: write transcribed text or copy a local file.
 
-        A source that already has an original keeps it; pass original=<vault path> to point it elsewhere.
+        The same original again changes nothing. A changed one (the document was updated) becomes a
+        new note or file next to the old one, and the source points at the new version; the old one
+        stays in the vault. An original the user linked from elsewhere in the vault (original=<path>)
+        is theirs to maintain and is never replaced this way.
         """
         text, file = source.get("original_text"), source.get("original_file")
         if not text and not file:
             return
         row = dict(con.execute(f"SELECT * FROM {SOURCES_TABLE} WHERE id = ?", (sid,)).fetchone())
-        if row.get("original") and (self.vault_root / row["original"]).exists():
+        current = row.get("original")
+        if current and (self.vault_root / current).exists() and not self._saved_original(current):
             return
         if file:
             path = vault.copy_file(self.vault_root, self.originals_dir, str(file))
         else:
             path = vault.write_text(self.vault_root, self.originals_dir, row, str(text))
+        if path == current:
+            return
         con.execute(f"UPDATE {SOURCES_TABLE} SET original = ? WHERE id = ?", (path, sid))
+        if current and (self.vault_root / current).exists():
+            change = {"source_id": sid, "title": row.get("title"), "previous": current, "original": path}
+            self.store.log("source", str(sid), "replace_original", change)
+            if replaced is not None:
+                replaced.append(change)
+
+    def _saved_original(self, path: str) -> bool:
+        """Whether an original is one this server saved (in the originals folder), not a note the user linked."""
+        return vault.inside((self.vault_root / path).resolve(), self.originals_dir.resolve())
 
     # -------------------------------------------------------------- records
     def _resolve_ref(
@@ -760,13 +778,14 @@ class Knowledge:
         result = {"inserted": [], "updated": [], "unchanged": [], "skipped": []}
         created_refs: dict[str, list[str]] = {}
         touched = {table}
+        replaced: list[dict[str, Any]] = []
         with self._write() as con:
-            batch_source = self._source_id(con, source)
+            batch_source = self._source_id(con, source, replaced)
             if batch_source is not None:
                 touched.add(SOURCES_TABLE)
             for i, rec, values, refs in prepared:
                 try:
-                    sid = self._source_id(con, rec["_source"]) if rec.get("_source") is not None else batch_source
+                    sid = self._source_id(con, rec["_source"], replaced) if rec.get("_source") is not None else batch_source
                     for name, value in refs.items():
                         values[name] = self._resolve_ref(con, ds, cols[name], value, create_missing_refs, sid, created_refs)
                         touched.add(cols[name]["ref_table"])
@@ -809,6 +828,7 @@ class Knowledge:
             **{k: v for k, v in result.items()},
             "created_references": created_refs,
             "source_id": batch_source,
+            **({"originals_replaced": replaced} if replaced else {}),
             "total_records": self._count(table),
         }
 
@@ -820,6 +840,7 @@ class Knowledge:
             raise KnowledgeError("ids is empty; find them with run_sql or search first.")
         ids = [int(i) for i in ids][:MAX_RECORDS]
         marks = ",".join("?" for _ in ids)
+        replaced: list[dict[str, Any]] = []
         with self._write() as con:
             found = {r[0] for r in con.execute(f"SELECT id FROM {q(table)} WHERE id IN ({marks})", ids)}
             missing = [i for i in ids if i not in found]
@@ -844,7 +865,7 @@ class Knowledge:
                     raise KnowledgeError("update needs values.")
                 cols = {c["name"]: c for c in spec["columns"]}
                 aliases = {c["name"][:-3]: c["name"] for c in cols.values() if c["type"] == "ref"}
-                sid = self._source_id(con, source)
+                sid = self._source_id(con, source, replaced)
                 created: dict[str, list[str]] = {}
                 clean: dict[str, Any] = {}
                 touched = {table}
@@ -868,6 +889,8 @@ class Knowledge:
         self._refresh(ds, tuple(touched))
         self.store.log("knowledge_records", term["id"], action, {"ids": ids})
         self.index.sync()
+        if replaced:
+            result["originals_replaced"] = replaced
         return {"entity": term["name"], **result, "total_records": self._count(table)}
 
     # ------------------------------------------------------------- concepts
@@ -902,10 +925,11 @@ class Knowledge:
             rels.append({**r, "relation": rel})
 
         source_id = None
+        replaced: list[dict[str, Any]] = []
         if source is not None:
             self.ds()
             with self._write() as con:
-                source_id = self._source_id(con, source)
+                source_id = self._source_id(con, source, replaced)
 
         term = self._find_term(ds, label)
         stamp = now()
@@ -1001,13 +1025,17 @@ class Knowledge:
         if self.is_knowledge(ds):
             self.index.sync()
         view = self.svc.get_term(tid, datasource=ds["name"])
-        return {"created": created, "stub_concepts_created": stubs, "relations_removed": removed, "concept": view}
+        out = {"created": created, "stub_concepts_created": stubs, "relations_removed": removed, "concept": view}
+        if replaced:
+            out["originals_replaced"] = replaced
+        return out
 
     # ------------------------------------------------------------- passages
     def save_passages(
-        self, passages: list[dict[str, Any]] | None = None, source: Any = None, delete_ids: list[int] | None = None
+        self, passages: list[dict[str, Any]] | None = None, source: Any = None, delete_ids: list[int] | None = None,
+        replace: bool = False,
     ) -> dict[str, Any]:
-        return self.index.save_passages(passages, source, delete_ids)
+        return self.index.save_passages(passages, source, delete_ids, replace)
 
     def search_text(
         self, query: str, kinds: list[str] | None = None, limit: int = 10, source: int | None = None, term: str | None = None
