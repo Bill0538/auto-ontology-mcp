@@ -638,6 +638,8 @@ auto-ontology-mcp config               print client configuration snippets
 
 ## Development
 
+Pull requests are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to send one.
+
 ```bash
 git clone https://github.com/gogoymh/auto-ontology-mcp && cd auto-ontology-mcp
 uv sync
