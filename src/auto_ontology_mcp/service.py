@@ -1338,7 +1338,7 @@ class OntologyService:
         ds = self.ds(datasource)
         a, b = self._table_of(ds, source), self._table_of(ds, target)
         g = self._graph(ds)
-        hops = g.path(a["id"], b["id"])
+        hops = g.best_path(a["id"], b["id"])
         if hops is None:
             return {
                 "found": False,
@@ -1414,10 +1414,14 @@ class OntologyService:
             verdict, advice = "uncertain", f"Weak matches for: {', '.join(weak)}. Check them with get_term or search_ontology before writing SQL."
         # Every entity having a Term is not enough: the Terms' tables must also be linked.
         links = self._entity_links(ds, results)
-        unlinked = [x for x in links if x["state"] != "linked"]
+        unlinked = [x for x in links if x["state"] in ("only_through_shared_parent", "not_linked")]
         if unlinked and verdict == "answerable":
             verdict = "uncertain"
             advice = " ".join(x["note"] for x in unlinked) + " " + advice
+        # Meeting at a table the question names (counts per company) keeps the verdict; say how to count.
+        per_parent = [x["note"] for x in links if x["state"] == "through_parent_in_question"]
+        if per_parent:
+            advice = " ".join(per_parent) + " " + advice
         concepts = sorted({
             m["name"] for r in results if r["state"] == "covered" for m in r["matches"][:1]
             if m["kind"] == "term" and m.get("term_kind") == "concept"
@@ -1439,7 +1443,13 @@ class OntologyService:
         }
 
     def _entity_links(self, ds: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """How the tables behind the matched entities connect: linked, only through a shared parent, or not at all."""
+        """How the tables behind the matched entities connect.
+
+        linked: a path that ties rows to rows. through_parent_in_question: they meet only at a table
+        another entity of the question maps to (companies, for counts per company), which is how
+        such a question is grouped. only_through_shared_parent: they meet only at a table the
+        question does not name. not_linked: no path at all.
+        """
         tables: dict[str, dict[str, Any]] = {}
         for r in results:
             ref = None
@@ -1465,13 +1475,33 @@ class OntologyService:
         for i, a in enumerate(ids):
             for b in ids[i + 1:]:
                 ta, tb = tables[a]["term"], tables[b]["term"]
+                linked = g.linked_path(a, b)
+                if linked is not None:
+                    links.append({"between": [ta, tb], "state": "linked", "path": [h["on"] for h in linked]})
+                    continue
+                # Both reach a table another entity of the question maps to (counts per company).
+                parent = next(
+                    (p for p in ids if p not in (a, b) and g.linked_path(a, p) is not None and g.linked_path(b, p) is not None),
+                    None,
+                )
                 hops = g.path(a, b)
-                if hops is None:
+                if hops is None and parent is None:
                     links.append({
                         "between": [ta, tb],
                         "state": "not_linked",
                         "note": f"No chain of relationships links {ta} and {tb}: they cannot be combined row by row. "
                         "Answer each part on its own, or tell the user the data does not link them.",
+                    })
+                    continue
+                if parent is not None:
+                    through = tables[parent]["term"]
+                    links.append({
+                        "between": [ta, tb],
+                        "state": "through_parent_in_question",
+                        "through": through,
+                        "note": f"{ta} and {tb} meet only at {through}, which the question also names: count or sum "
+                        f"each per {through} in its own subquery or CTE, then join the results on {through}. Joining "
+                        f"{ta} and {tb} rows to each other directly repeats them and does not say which belongs to which.",
                     })
                     continue
                 shared = shared_parents(hops)

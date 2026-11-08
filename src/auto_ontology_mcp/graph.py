@@ -12,22 +12,24 @@ def _label(schema: str | None, table: str) -> str:
 
 
 def shared_parents(hops: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Tables that are the one side of two or more hops.
+    """Tables that two or more hops reference (their key is the target of the foreign key).
 
-    Their many sides are related only through that table: order_lines → products ← product_tags
-    pairs every order line with every tag of the same product, which says nothing about which line
-    belongs to which tag. Joining such siblings in one SELECT also multiplies their rows.
+    The referencing tables are related only through that table: order_lines → products ←
+    product_tags pairs every order line with every tag of the same product, which says nothing
+    about which line belongs to which tag. Joining such siblings in one SELECT also multiplies
+    their rows. The foreign key direction decides, not the cardinality: a one-to-one cardinality
+    inferred from sampled data (one child row per parent so far) does not make two tables linked.
     """
     children: dict[str, list[str]] = {}
     for hop in hops:
-        if hop["multiplicity"] == "many-to-one":
-            one, many = hop["to"], hop["from"]
-        elif hop["multiplicity"] == "one-to-many":
-            one, many = hop["from"], hop["to"]
-        else:
-            continue
-        if many not in children.setdefault(one, []):
-            children[one].append(many)
+        parent = hop.get("referenced")
+        if parent is None:  # hops built before the field existed
+            parent = {"many-to-one": hop["to"], "one-to-many": hop["from"]}.get(hop["multiplicity"])
+            if parent is None:
+                continue
+        child = hop["from"] if parent == hop["to"] else hop["to"]
+        if child not in children.setdefault(parent, []):
+            children[parent].append(child)
     return [{"parent": p, "children": c} for p, c in children.items() if len(c) >= 2]
 
 
@@ -74,6 +76,62 @@ class JoinGraph:
                 queue.append((nxt, depth + 1))
         return None
 
+    def linked_path(self, start: str, goal: str, max_hops: int = 6) -> list[dict[str, Any]] | None:
+        """Shortest path that never goes up to a table and straight back down from it.
+
+        a → parent ← b only says that a and b share a parent; it does not link a row of a to a row
+        of b. When the shortest path has that shape, a path that only climbs from a row to the rows
+        it references (an order line → its order → the order's customer), or comes down and climbs
+        again through a bridge table, is the real link even if it is longer. None when no such path
+        exists.
+        """
+        if start == goal:
+            return []
+        # A state is (table, came_up): after following a foreign key to the table it references,
+        # the next hop may not go down to another table that references it.
+        begin = (start, False)
+        prev: dict[tuple[str, bool], tuple[tuple[str, bool], dict[str, Any], str]] = {}
+        seen = {begin}
+        queue = deque([(begin, 0)])
+        while queue:
+            state, depth = queue.popleft()
+            if depth >= max_hops:
+                continue
+            node, came_up = state
+            for nxt, rel, direction in self._edges(node):
+                # Direction, not cardinality: a one-to-one inferred from sampled data still only shares the table.
+                if came_up and direction == "reverse":
+                    continue  # up then down: the two sides only share this table
+                nstate = (nxt, direction == "forward")
+                if nstate in seen or any(s[0] == nxt for s in self._trail(prev, state, begin)):
+                    continue
+                seen.add(nstate)
+                prev[nstate] = (state, rel, direction)
+                if nxt == goal:
+                    hops = []
+                    cur = nstate
+                    while cur != begin:
+                        p, r, d = prev[cur]
+                        hops.append(self._hop(p[0], cur[0], r, d))
+                        cur = p
+                    return list(reversed(hops))
+                queue.append((nstate, depth + 1))
+        return None
+
+    @staticmethod
+    def _trail(prev: dict, state: tuple[str, bool], begin: tuple[str, bool]) -> list[tuple[str, bool]]:
+        """States on the way to *state*, so a path never visits a table twice."""
+        out = [state]
+        while state != begin:
+            state = prev[state][0]
+            out.append(state)
+        return out
+
+    def best_path(self, start: str, goal: str, max_hops: int = 6) -> list[dict[str, Any]] | None:
+        """The linked path when there is one, otherwise the shortest path."""
+        linked = self.linked_path(start, goal, max_hops)
+        return linked if linked is not None else self.path(start, goal, max_hops)
+
     def alternatives(self, a: str, b: str) -> list[dict[str, Any]]:
         """Other direct relationships between two tables (e.g. billing vs delivery city)."""
         out = []
@@ -92,19 +150,22 @@ class JoinGraph:
             on = f"{ft['name']}.{rel['target_column']} = {tt['name']}.{rel['source_column']}"
             multiplicity = "one-to-many" if rel.get("cardinality") != "one_to_one" else "one-to-one"
             fanout = rel.get("cardinality") != "one_to_one"
+        frm_label, to_label = _label(ft.get("schema_name"), ft["name"]), _label(tt.get("schema_name"), tt["name"])
         return {
-            "from": _label(ft.get("schema_name"), ft["name"]),
-            "to": _label(tt.get("schema_name"), tt["name"]),
+            "from": frm_label,
+            "to": to_label,
             "on": on,
             "multiplicity": multiplicity,
             "fans_out": fanout,
+            "referenced": to_label if direction == "forward" else frm_label,
             "relationship_id": rel["id"],
             "role": rel.get("role"),
             "is_default": bool(rel.get("is_default")),
         }
 
     def connect(self, table_ids: list[str]) -> tuple[list[dict[str, Any]], list[str]]:
-        """Greedy Steiner tree: join every table to the growing set by its shortest path."""
+        """Greedy Steiner tree: join every table to the growing set by its shortest linked path
+        (see linked_path), or by its shortest path when no linked one exists."""
         if not table_ids:
             return [], []
         tree = {table_ids[0]}
@@ -114,10 +175,13 @@ class JoinGraph:
             if tid in tree:
                 continue
             best = None
-            for anchor in tree:
-                p = self.path(anchor, tid)
-                if p is not None and (best is None or len(p) < len(best)):
-                    best = p
+            for find in (self.linked_path, self.path):
+                for anchor in tree:
+                    p = find(anchor, tid)
+                    if p is not None and (best is None or len(p) < len(best)):
+                        best = p
+                if best is not None:
+                    break  # a linked path from any anchor beats a shorter one through a shared parent
             if best is None:
                 unreachable.append(tid)
                 continue

@@ -226,6 +226,15 @@ def test_check_answerable_looks_at_how_terms_link(modeled):
     assert shared["links"][0]["through"] == "products"
     assert "meet only at products" in shared["next_step"]
 
+    # The same tables when the question also names the product: revenue per product and tag counts
+    # per product are each counted per product, which is what such a question asks.
+    per_product = modeled.check_answerable("Revenue and number of tags per product", ["revenue", "tag", "product"])
+    assert per_product["verdict"] == "answerable"
+    by_pair = {tuple(x["between"]): x for x in per_product["links"]}
+    assert by_pair[("Order Line", "Tag")]["state"] == "through_parent_in_question"
+    assert by_pair[("Order Line", "Tag")]["through"] == "Product"
+    assert "which the question also names" in per_product["next_step"]
+
     modeled.set_relationship("reject", source="product_tags.tag_id", target="tags.tag_id")
     apart = modeled.check_answerable("Which order lines belong to which tag?", ["order line", "tag"])
     assert apart["verdict"] == "uncertain"
