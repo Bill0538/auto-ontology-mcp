@@ -18,7 +18,7 @@ from .catalog import Scanner
 from .config import Settings
 from .datasources import Connections, mask_url, normalize_url, short_error, sqlglot_dialect
 from .errors import KnowledgeError, OntologyError  # noqa: F401 (re-exported)
-from .graph import JoinGraph
+from .graph import JoinGraph, shared_parents
 from .inference import names_own_table
 from .knowledge import KNOWLEDGE_DS, SOURCES_TABLE, Knowledge, is_builtin
 from .naming import clean_label, compact, id_base, to_label
@@ -35,6 +35,17 @@ _MEASURE_WORDS = {"amount", "price", "cost", "total", "revenue", "sales", "qty",
 
 def _label(schema: str | None, name: str) -> str:
     return f"{schema}.{name}" if schema else name
+
+
+def _shared_parent_note(shared: dict[str, Any]) -> str:
+    parent, children = shared["parent"], shared["children"]
+    listed = " and ".join(children) if len(children) == 2 else ", ".join(children)
+    return (
+        f"{listed} meet only at {parent}: each of them is joined one-to-many from {parent}, so the path pairs "
+        f"every row of one with every row of the other for the same {parent} row. Use it for pairs or for a grouping "
+        f"by one side; to count or sum them side by side, aggregate each in its own subquery or CTE and join the "
+        f"results on {parent}. It does not say which row of one became or belongs to which row of the other."
+    )
 
 
 class OntologyService:
@@ -145,6 +156,17 @@ class OntologyService:
                 )
             else:
                 verdict, step = "ready", "Ask questions: check_answerable → get_query_context → validate_sql → run_sql."
+            notes = []
+            examples = self.store.examples(ds["id"])
+            if verdict == "ready" and ds["name"] != KNOWLEDGE_DS:
+                if not sql_attrs and not examples:
+                    notes.append(
+                        "No SQL attributes or verified example queries yet: every count, total and filter will be "
+                        "written from scratch. Before relying on answers, run suggest_sql_attributes and save the "
+                        "measures and filters a person agrees with, and save_example_query for confirmed answers."
+                    )
+                if terms and not any(t["status"] == "certified" for t in terms):
+                    notes.append("No Term is certified yet; answers will cite draft Terms until a person certifies them.")
             if ds["name"] == KNOWLEDGE_DS:
                 stats = self.knowledge.stats()
                 if not stats.get("entities") and not stats.get("concepts"):
@@ -170,9 +192,10 @@ class OntologyService:
                         "proposed": sum(r["status"] == "proposed" for r in rels),
                     },
                     "sql_attributes": len(sql_attrs),
-                    "example_queries": len(self.store.examples(ds["id"])),
+                    "example_queries": len(examples),
                     "verdict": verdict,
                     "next_step": step,
+                    **({"notes": notes} if notes else {}),
                     **({"knowledge": self.knowledge.stats()} if ds["name"] == KNOWLEDGE_DS else {}),
                 }
             )
@@ -1336,6 +1359,7 @@ class OntologyService:
             "hops": hops,
             "join_sql": self._render_join(ds, hops),
             "fan_out_warning": [f"{h['from']} → {h['to']} is one-to-many: rows of {h['from']} repeat." for h in hops if h["fans_out"]],
+            "shared_parent_warning": [_shared_parent_note(s) for s in shared_parents(hops)],
             "role_alternatives": alternatives,
         }
 
@@ -1388,6 +1412,12 @@ class OntologyService:
             )
         else:
             verdict, advice = "uncertain", f"Weak matches for: {', '.join(weak)}. Check them with get_term or search_ontology before writing SQL."
+        # Every entity having a Term is not enough: the Terms' tables must also be linked.
+        links = self._entity_links(ds, results)
+        unlinked = [x for x in links if x["state"] != "linked"]
+        if unlinked and verdict == "answerable":
+            verdict = "uncertain"
+            advice = " ".join(x["note"] for x in unlinked) + " " + advice
         concepts = sorted({
             m["name"] for r in results if r["state"] == "covered" for m in r["matches"][:1]
             if m["kind"] == "term" and m.get("term_kind") == "concept"
@@ -1403,9 +1433,64 @@ class OntologyService:
             "coverage": coverage,
             "verdict": verdict,
             "entities": results,
+            "links": links,
             "next_step": advice,
             "entity_rules": None if entities else guidance.ENTITY_RULES,
         }
+
+    def _entity_links(self, ds: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """How the tables behind the matched entities connect: linked, only through a shared parent, or not at all."""
+        tables: dict[str, dict[str, Any]] = {}
+        for r in results:
+            ref = None
+            if r["state"] == "covered" and r["matches"]:
+                top = r["matches"][0]
+                ref = top["name"] if top["kind"] == "term" else top.get("term")
+            elif r["state"] == "covered_by_value" and r.get("value_matches"):
+                ref = r["value_matches"][0].get("term")
+            if not ref:
+                continue
+            try:
+                term = self.term_ref(ds, ref)
+            except OntologyError:
+                continue
+            tid = term.get("primary_table_id")
+            if tid and tid not in tables:
+                tables[tid] = {"term": term["name"], "entity": r["entity"]}
+        if len(tables) < 2:
+            return []
+        g = self._graph(ds)
+        ids = list(tables)
+        links = []
+        for i, a in enumerate(ids):
+            for b in ids[i + 1:]:
+                ta, tb = tables[a]["term"], tables[b]["term"]
+                hops = g.path(a, b)
+                if hops is None:
+                    links.append({
+                        "between": [ta, tb],
+                        "state": "not_linked",
+                        "note": f"No chain of relationships links {ta} and {tb}: they cannot be combined row by row. "
+                        "Answer each part on its own, or tell the user the data does not link them.",
+                    })
+                    continue
+                shared = shared_parents(hops)
+                if shared:
+                    through = shared[0]["parent"]
+                    links.append({
+                        "between": [ta, tb],
+                        "state": "only_through_shared_parent",
+                        "through": through,
+                        "path": [h["on"] for h in hops],
+                        "note": f"{ta} and {tb} meet only at {through}: the path pairs every {ta} row with every "
+                        f"{tb} row of the same {through} row. That fits a question about pairs or a grouping by one side, "
+                        f"but nothing says which {ta} row became or belongs to which {tb} row. If the question needs "
+                        "that, add a condition that ties the two rows (for example the same person) or say the data "
+                        "has no such link.",
+                    })
+                else:
+                    links.append({"between": [ta, tb], "state": "linked", "path": [h["on"] for h in hops]})
+        return links
 
     def _value_hits(self, ds: dict[str, Any], phrase: str, budget: list[int]) -> list[dict[str, Any]]:
         """Text columns of modeled Terms whose stored values contain every word of *phrase*."""
@@ -1515,6 +1600,7 @@ class OntologyService:
                 "hops": hops,
                 "join_sql": self._render_join(ds, hops),
                 "role_notes": role_notes,
+                "shared_parent_notes": [_shared_parent_note(s) for s in shared_parents(hops)],
                 "unreachable_terms": [g.tables[t]["name"] for t in unreachable],
             },
             "verified_examples": examples,

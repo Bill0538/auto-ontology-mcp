@@ -153,6 +153,9 @@ column; join each foreign key to the key it actually references.
 - Use explicit INNER/LEFT/RIGHT/FULL JOIN … ON. No NATURAL, LATERAL or comma joins.
 - Aggregate detail rows at their own grain before joining them to a parent whose measure you \
 also aggregate (fan-out). A ratio of totals is not a mean of ratios.
+- Two tables that each hang one-to-many from the same parent (a customer's orders and payments) \
+are related only through it: count or sum each in its own subquery, then join the results on the \
+parent. Such a path does not tell which row of one belongs to which row of the other.
 - Respect value formats shown in the context (date strings, fractions vs percents, codes).
 - A filter on a single constant value does not need that column in SELECT.
 """

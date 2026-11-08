@@ -11,6 +11,26 @@ def _label(schema: str | None, table: str) -> str:
     return f"{schema}.{table}" if schema else table
 
 
+def shared_parents(hops: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Tables that are the one side of two or more hops.
+
+    Their many sides are related only through that table: order_lines → products ← product_tags
+    pairs every order line with every tag of the same product, which says nothing about which line
+    belongs to which tag. Joining such siblings in one SELECT also multiplies their rows.
+    """
+    children: dict[str, list[str]] = {}
+    for hop in hops:
+        if hop["multiplicity"] == "many-to-one":
+            one, many = hop["to"], hop["from"]
+        elif hop["multiplicity"] == "one-to-many":
+            one, many = hop["from"], hop["to"]
+        else:
+            continue
+        if many not in children.setdefault(one, []):
+            children[one].append(many)
+    return [{"parent": p, "children": c} for p, c in children.items() if len(c) >= 2]
+
+
 class JoinGraph:
     def __init__(self, relationships: list[dict[str, Any]], tables: list[dict[str, Any]]) -> None:
         self.tables = {t["id"]: t for t in tables}

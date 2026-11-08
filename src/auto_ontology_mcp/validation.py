@@ -117,6 +117,7 @@ class Validator:
 
         fanned = self._check_joins(analysis, errors, warnings, notes, probe)
         self._check_fanout(analysis, fanned, warnings)
+        self._check_branch_fanout(analysis, fanned, warnings)
         if probe:
             self._check_string_literals(analysis, warnings)
             self._check_numeric_scale(analysis, warnings)
@@ -281,6 +282,77 @@ class Validator:
                             f"{many_side[1]} row. Aggregate {many_side[1]} first (subquery/CTE) or aggregate at "
                             f"{one_side[1]} grain."
                         )
+
+    def _check_branch_fanout(
+        self, analysis: Analysis, fanned: set[tuple[tuple[str, str], tuple[str, str]]], warnings: list[str]
+    ) -> None:
+        """Fan-out from a sibling branch: rows aggregated from one table repeat once per row of
+        another table that hangs one-to-many from a table they share (a chasm trap). Summing a
+        product's order lines while also joining its product tags repeats each line once per tag.
+
+        _check_fanout covers aggregating the one side itself; this walks from the aggregated
+        table up its many-to-one joins and flags every one-to-many join that leaves the walk.
+        """
+        if not fanned:
+            return
+        one_to_many = {(one[1].casefold(), many[1].casefold()) for one, many in fanned}
+        names = {t.casefold(): t for _, t in analysis.tables}
+        edges: dict[str, set[str]] = {}
+        for a, b, _origin in analysis.joins:
+            ta, tb = a.table.casefold(), b.table.casefold()
+            if ta != tb:
+                edges.setdefault(ta, set()).add(tb)
+                edges.setdefault(tb, set()).add(ta)
+        reported: set[str] = set()
+        for agg in analysis.aggregates:
+            if agg["distinct"] or not agg["columns"] or agg["sql"] in reported:
+                continue
+            scope = {t.casefold() for _, t in agg["scope_tables"]}
+            start = {v.table.casefold() for v in (agg.get("value_columns") or agg["columns"])}
+            if not start or not start <= scope:
+                continue
+            grouped = {t.casefold() for _, t in agg.get("group_tables") or []}
+            branches: dict[str, list[str]] = {}
+            reached, queue = set(start), list(start)
+            while queue:
+                u = queue.pop()
+                for v in sorted(edges.get(u, ())):
+                    if v not in scope or v in reached:
+                        continue
+                    if (u, v) not in one_to_many:
+                        reached.add(v)  # many-to-one (or one-to-one): one row per aggregated row
+                        queue.append(v)
+                        continue
+                    if u in start:
+                        continue  # aggregating the one side itself: _check_fanout reports it
+                    if self._branch(edges, v, u, scope) & grouped:
+                        continue  # grouped by the branch (revenue by tag): one row per pair is the point
+                    if v not in branches.setdefault(u, []):
+                        branches[u].append(v)
+            if not branches:
+                continue
+            reported.add(agg["sql"])
+            agg_tables = ", ".join(sorted(names.get(t, t) for t in start))
+            for u, vs in branches.items():
+                parent = names.get(u, u)
+                listed = " and ".join(names.get(v, v) for v in vs)
+                warnings.append(
+                    f"Fan-out: {agg['sql']} aggregates {agg_tables} rows, but {parent} is also joined one-to-many "
+                    f"to {listed}, so each {agg_tables} row is repeated for every matching row of {listed}. "
+                    f"{agg_tables} and {listed} are related only through {parent}: aggregate each one-to-many "
+                    f"branch in its own subquery or CTE, then join the results on {parent}."
+                )
+
+    @staticmethod
+    def _branch(edges: dict[str, set[str]], start: str, parent: str, scope: set[str]) -> set[str]:
+        """Tables reachable from *start* without going back through *parent*."""
+        seen, queue = {start}, [start]
+        while queue:
+            for nxt in edges.get(queue.pop(), ()):
+                if nxt != parent and nxt in scope and nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        return seen
 
     # --------------------------------------------------------------- literals
     def _check_string_literals(self, analysis: Analysis, warnings: list[str]) -> None:

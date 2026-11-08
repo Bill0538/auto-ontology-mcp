@@ -33,6 +33,12 @@ def test_readiness_after_modeling(modeled):
     ready = modeled.check_readiness()["datasources"][0]
     assert ready["verdict"] == "ready"
     assert ready["terms"]["total"] == 10
+    # Ready to ask, but nothing agreed yet: every count and filter would be written from scratch.
+    assert any("No SQL attributes or verified example queries" in n for n in ready["notes"])
+    assert any("No Term is certified" in n for n in ready["notes"])
+    modeled.save_example_query("How many orders?", "SELECT COUNT(*) FROM orders")
+    modeled.update_term("Order", status="certified")
+    assert "notes" not in modeled.check_readiness()["datasources"][0]
 
 
 def test_search_handles_synonyms_case_and_korean(modeled):
@@ -134,6 +140,96 @@ def test_fan_out_looks_at_what_is_aggregated(modeled, aggregate, fans_out):
     )
     warnings = modeled.validate_sql(sql)["warnings"]
     assert any(w.startswith("Fan-out") for w in warnings) is fans_out, warnings
+
+
+@pytest.mark.parametrize(
+    ("sql", "fans_out"),
+    [
+        # Lines and tags both hang one-to-many from products: each line repeats once per tag.
+        (
+            "SELECT p.product_name, SUM(l.line_total) AS revenue FROM products p "
+            "JOIN order_lines l ON l.product_id = p.product_id "
+            "JOIN product_tags pt ON pt.product_id = p.product_id GROUP BY p.product_name",
+            True,
+        ),
+        (
+            "SELECT p.product_name, COUNT(l.order_line_id) AS lines, COUNT(pt.tag_id) AS tags FROM products p "
+            "JOIN order_lines l ON l.product_id = p.product_id "
+            "JOIN product_tags pt ON pt.product_id = p.product_id GROUP BY p.product_name",
+            True,
+        ),
+        # Revenue by tag: one row per (line, tag) pair is what the grouping asks for.
+        (
+            "SELECT t.tag_name, SUM(l.line_total) AS revenue FROM order_lines l "
+            "JOIN products p ON p.product_id = l.product_id "
+            "JOIN product_tags pt ON pt.product_id = p.product_id "
+            "JOIN tags t ON t.tag_id = pt.tag_id GROUP BY t.tag_name",
+            False,
+        ),
+        # Each branch aggregated on its own, then joined on the parent.
+        (
+            "SELECT p.product_name, s.revenue, g.tags FROM products p "
+            "JOIN (SELECT product_id, SUM(line_total) AS revenue FROM order_lines GROUP BY product_id) s ON s.product_id = p.product_id "
+            "JOIN (SELECT product_id, COUNT(*) AS tags FROM product_tags GROUP BY product_id) g ON g.product_id = p.product_id",
+            False,
+        ),
+        # Walking up many-to-one joins only (line → order → customer) repeats nothing.
+        (
+            "SELECT c.segment, SUM(l.line_total) FROM order_lines l JOIN orders o ON o.order_id = l.order_id "
+            "JOIN customers c ON c.customer_id = o.customer_id GROUP BY c.segment",
+            False,
+        ),
+    ],
+)
+def test_fan_out_across_sibling_branches(modeled, sql, fans_out):
+    warnings = modeled.validate_sql(sql)["warnings"]
+    branch = [w for w in warnings if w.startswith("Fan-out") and "related only through products" in w]
+    assert bool(branch) is fans_out, warnings
+    if fans_out:
+        assert len(branch) == len([w for w in warnings if "related only through" in w])
+
+
+def test_literals_compared_in_the_select_list_are_checked(modeled):
+    for sql in (
+        "SELECT SUM(o.status = 'shipped') FROM orders o",
+        "SELECT COUNT(CASE WHEN o.status = 'shipped' THEN 1 END) FROM orders o",
+        "SELECT SUM(CASE WHEN o.status IN ('shipped', 'Delivered') THEN 1 ELSE 0 END) FROM orders o",
+    ):
+        result = modeled.validate_sql(sql)
+        assert result["valid"] is True
+        assert any("'Shipped'" in w for w in result["warnings"]), (sql, result["warnings"])
+    # A column-to-column comparison in the select list is not a join.
+    same = modeled.validate_sql("SELECT SUM(l.unit_price = p.unit_price) FROM order_lines l JOIN products p ON p.product_id = l.product_id")
+    assert same["valid"] is True and not same["warnings"]
+
+
+def test_join_path_through_a_shared_parent_is_flagged(modeled):
+    shared = modeled.find_join_path("Order Line", "Tag")
+    assert [h["multiplicity"] for h in shared["hops"]] == ["many-to-one", "one-to-many", "many-to-one"]
+    assert len(shared["shared_parent_warning"]) == 1
+    assert shared["shared_parent_warning"][0].startswith("order_lines and product_tags meet only at products")
+    assert modeled.find_join_path("Order Line", "State")["shared_parent_warning"] == []
+
+    ctx = modeled.get_query_context(["Product", "Order Line", "Tag"])
+    assert any("meet only at products" in n for n in ctx["join_path"]["shared_parent_notes"])
+    assert modeled.get_query_context(["Order Line", "State"])["join_path"]["shared_parent_notes"] == []
+
+
+def test_check_answerable_looks_at_how_terms_link(modeled):
+    linked = modeled.check_answerable("Revenue by state in 2024", ["revenue", "state"])
+    assert linked["verdict"] == "answerable"
+    assert [x["state"] for x in linked["links"]] == ["linked"]
+
+    shared = modeled.check_answerable("Which order lines belong to which tag?", ["order line", "tag"])
+    assert shared["verdict"] == "uncertain"
+    assert shared["links"][0]["state"] == "only_through_shared_parent"
+    assert shared["links"][0]["through"] == "products"
+    assert "meet only at products" in shared["next_step"]
+
+    modeled.set_relationship("reject", source="product_tags.tag_id", target="tags.tag_id")
+    apart = modeled.check_answerable("Which order lines belong to which tag?", ["order line", "tag"])
+    assert apart["verdict"] == "uncertain"
+    assert apart["links"][0]["state"] == "not_linked"
 
 
 def test_run_sql_returns_rows_grounding_and_logs(modeled):

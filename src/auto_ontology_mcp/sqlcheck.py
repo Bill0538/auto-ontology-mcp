@@ -365,32 +365,14 @@ def analyze(sql_or_tree: str | exp.Expression, columns: list[dict[str, Any]], di
                     if a and b and a.table_key != b.table_key:
                         analysis.joins.append((a, b, origin))
                     continue
-                if isinstance(node, (exp.EQ, exp.NEQ, exp.Like, exp.ILike)):
-                    col = _column_side(node.left) or _column_side(node.right)
-                    lit = node.right if _column_side(node.left) else node.left
-                    value = _literal_value(lit)
-                    if col is not None and value is not None:
-                        phys = _trace(scope, col)
-                        if phys is None:
-                            continue
-                        entry = {"column": phys, "op": type(node).__name__.upper(), "values": [value], "sql": node.sql(dialect=dialect)}
-                        if isinstance(value, str):
-                            analysis.string_filters.append(entry)
-                        elif isinstance(node, (exp.EQ, exp.NEQ)):
-                            analysis.numeric_filters.append(entry)
-                    continue
-                if isinstance(node, exp.In):
-                    col = _column_side(node.this)
-                    values = [_literal_value(v) for v in node.expressions]
-                    if col is not None and values and all(v is not None for v in values):
-                        phys = _trace(scope, col)
-                        if phys is None:
-                            continue
-                        entry = {"column": phys, "op": "IN", "values": values, "sql": node.sql(dialect=dialect)}
-                        if all(isinstance(v, str) for v in values):
-                            analysis.string_filters.append(entry)
-                        else:
-                            analysis.numeric_filters.append(entry)
+                if isinstance(node, (exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In)):
+                    entry = _literal_filter(scope, node, dialect)
+                    if entry is None:
+                        continue
+                    if all(isinstance(v, str) for v in entry["values"]):
+                        analysis.string_filters.append(entry)
+                    elif isinstance(node, (exp.EQ, exp.NEQ, exp.In)):
+                        analysis.numeric_filters.append(entry)
                     continue
                 if isinstance(node, exp.Between):
                     col = _column_side(node.this)
@@ -411,6 +393,18 @@ def analyze(sql_or_tree: str | exp.Expression, columns: list[dict[str, Any]], di
                     if phys:
                         analysis.numeric_filters.append({"column": phys, "op": type(node).__name__.upper(), "values": [value], "sql": node.sql(dialect=dialect)})
 
+        # A comparison in the select list (SUM(col = 'x'), COUNT(CASE WHEN col = 'x' THEN 1 END))
+        # picks rows just as WHERE does, so its string literals are checked against stored values
+        # too. Column-to-column comparisons there are not joins.
+        for projection in select.expressions:
+            for node in projection.find_all(exp.EQ, exp.NEQ, exp.Like, exp.ILike, exp.In):
+                if node.find_ancestor(exp.Select) is not select:
+                    continue
+                entry = _literal_filter(scope, node, dialect)
+                if entry is not None and all(isinstance(v, str) for v in entry["values"]):
+                    analysis.string_filters.append(entry)
+
+        group_tables = _group_tables(scope, select)
         for agg in select.find_all(exp.Sum, exp.Avg, exp.Count):
             if agg.find_ancestor(exp.Select) is not select:
                 continue
@@ -436,9 +430,48 @@ def analyze(sql_or_tree: str | exp.Expression, columns: list[dict[str, Any]], di
                     "scope_tables": [
                         (s.db or "", s.name) for s in scope.sources.values() if isinstance(s, exp.Table)
                     ],
+                    "group_tables": group_tables,
                 }
             )
     return analysis
+
+
+def _literal_filter(scope: Scope, node: exp.Expression, dialect: str | None) -> dict[str, Any] | None:
+    """``col = 'x'`` / ``col LIKE 'x%'`` / ``col IN ('a', 'b')`` as a filter entry, or None."""
+    if isinstance(node, exp.In):
+        col = _column_side(node.this)
+        values = [_literal_value(v) for v in node.expressions]
+        if col is None or not values or any(v is None for v in values):
+            return None
+        op = "IN"
+    else:
+        col = _column_side(node.left) or _column_side(node.right)
+        lit = node.right if _column_side(node.left) else node.left
+        value = _literal_value(lit)
+        if col is None or value is None:
+            return None
+        values, op = [value], type(node).__name__.upper()
+    phys = _trace(scope, col)
+    if phys is None:
+        return None
+    return {"column": phys, "op": op, "values": values, "sql": node.sql(dialect=dialect)}
+
+
+def _group_tables(scope: Scope, select: exp.Select) -> list[tuple[str, str]]:
+    """Physical tables whose columns the GROUP BY uses (``GROUP BY 1`` points into the select list)."""
+    group = select.args.get("group")
+    if group is None:
+        return []
+    out: list[tuple[str, str]] = []
+    for item in group.expressions:
+        if isinstance(item, exp.Literal) and not item.is_string and item.this.isdigit():
+            idx = int(item.this) - 1
+            item = select.expressions[idx] if 0 <= idx < len(select.expressions) else item
+        for col in item.find_all(exp.Column):
+            phys = _trace(scope, col)
+            if phys and (phys.schema, phys.table) not in out:
+                out.append((phys.schema, phys.table))
+    return out
 
 
 # ------------------------------------------------------------ expression mining
