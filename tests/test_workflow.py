@@ -110,6 +110,33 @@ def test_validate_catches_unknown_column_and_bad_join(modeled):
     assert not role["grounding"]["unmodeled_columns"]
 
 
+def test_a_join_defined_as_a_sql_attribute_is_known(modeled):
+    sql = (
+        "SELECT COUNT(*) FROM order_lines l JOIN products p "
+        "ON p.product_id = l.product_id AND p.unit_price = l.unit_price"
+    )
+    before = modeled.validate_sql(sql)
+    # The list-price condition is not how the ontology joins these two tables.
+    assert before["valid"] is False
+    assert any("unit_price" in e for e in before["errors"])
+
+    modeled.save_sql_attribute(
+        "Order Line",
+        "Lines At List Price",
+        "SELECT l.order_line_id FROM order_lines l JOIN products p ON p.product_id = l.product_id AND p.unit_price = l.unit_price",
+        "Order lines sold at the product's list price.",
+        kind="join",
+    )
+    after = modeled.validate_sql(sql)
+    assert after["valid"] is True, after["errors"]
+    assert not any("unit_price" in w for w in after["warnings"])
+    assert any("SQL attribute 'Lines At List Price'" in n for n in after["notes"])
+    # Other joins between the same tables are still checked.
+    assert modeled.validate_sql(
+        "SELECT COUNT(*) FROM order_lines l JOIN products p ON p.product_id = l.order_line_id"
+    )["valid"] is False
+
+
 def test_validate_catches_fan_out(modeled):
     result = modeled.validate_sql(
         "SELECT SUM(p.unit_price) FROM products p JOIN order_lines l ON l.product_id = p.product_id"
