@@ -359,6 +359,26 @@ def test_glossary(modeled):
     assert modeled.search_ontology("AOV")["hits"][0]["kind"] == "glossary"
 
 
+def test_check_answerable_resolves_a_glossary_phrase_to_the_model(modeled):
+    modeled.save_glossary([{"name": "GMV", "definition": "Order Line › Revenue (order_lines.line_total) summed over every order"}])
+    result = modeled.check_answerable("GMV by state", ["GMV", "state"])
+    gmv = next(e for e in result["entities"] if e["entity"] == "GMV")
+    # The glossary interprets the phrase; its definition is what gets matched to the model.
+    assert gmv["state"] == "covered_via_glossary"
+    assert gmv["glossary"]["name"] == "GMV"
+    assert all(m["kind"] != "glossary" for m in gmv["matches"])
+    assert gmv["matches"][0].get("term", gmv["matches"][0]["name"]) == "Order Line"
+    assert result["verdict"] == "answerable"
+    assert [(x["between"], x["state"]) for x in result["links"]] == [(["Order Line", "State"], "linked")]
+
+
+def test_a_glossary_entry_alone_does_not_cover_a_phrase(modeled):
+    modeled.save_glossary([{"name": "NPS", "definition": "net promoter score from surveys"}])
+    nps = modeled.check_answerable("NPS by segment", ["NPS"])["entities"][0]
+    assert nps["glossary"]["name"] == "NPS"
+    assert nps["state"] not in ("covered", "covered_via_glossary")
+
+
 def test_export_import_roundtrip(modeled, settings, demo_path, tmp_path):
     from dataclasses import replace
 

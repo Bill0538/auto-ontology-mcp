@@ -1375,12 +1375,26 @@ class OntologyService:
         covered = 0.0
         value_budget = [60]  # columns probed across the whole question
         for ent in entities:
-            hits = self._search(ds, ent, kinds=["term", "attribute", "sql_attribute", "glossary", "table"], limit=3, docs=docs)
+            found = self._search(ds, ent, kinds=["term", "attribute", "sql_attribute", "glossary", "table"], limit=6, docs=docs)
+            # As upstream, the glossary interprets a phrase and the semantic model covers it: a glossary
+            # entry is never the match itself, its definition is looked up instead.
+            glossary = [h for h in found if h["kind"] == "glossary"]
+            hits = [h for h in found if h["kind"] != "glossary"][:3]
             top = hits[0] if hits else None
             entry: dict[str, Any] = {"entity": ent}
+            if glossary and glossary[0]["score"] >= 0.55:
+                entry["glossary"] = {"name": glossary[0]["name"], "definition": glossary[0].get("definition")}
+            resolved = []
+            if "glossary" in entry and not (top and top["kind"] != "table" and top["score"] >= 0.55):
+                resolved = self._glossary_targets(ds, entry["glossary"]["definition"] or "", docs)
             if top and top["kind"] != "table" and top["score"] >= 0.55:
                 state = "covered"
                 covered += 1
+            elif resolved:
+                state = "covered_via_glossary"
+                covered += 1
+                hits = resolved
+                top = hits[0]
             else:
                 # Names of things (a product, a place, a status) live in the data, not the schema.
                 values = self._value_hits(ds, ent, value_budget)
@@ -1442,6 +1456,21 @@ class OntologyService:
             "entity_rules": None if entities else guidance.ENTITY_RULES,
         }
 
+    def _glossary_targets(self, ds: dict[str, Any], definition: str, docs) -> list[dict[str, Any]]:
+        """What a glossary definition points at in the semantic model.
+
+        A definition that names a Term, attribute or SQL attribute ("Order Line › Revenue") points at
+        it; the longest name wins, so an attribute beats its Term. Otherwise the definition is
+        searched like a phrase.
+        """
+        text = definition.casefold()
+        named = [d for d in docs if d.kind in ("term", "attribute", "sql_attribute") and d.title and d.title.casefold() in text]
+        if named:
+            named.sort(key=lambda d: -len(d.title))
+            return [{**d.payload, "kind": d.kind, "id": d.id, "name": d.title, "score": 1.0} for d in named[:3]]
+        hits = self._search(ds, definition, kinds=["term", "attribute", "sql_attribute"], limit=3, docs=docs)
+        return [h for h in hits if h["score"] >= 0.35]
+
     def _entity_links(self, ds: dict[str, Any], results: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """How the tables behind the matched entities connect.
 
@@ -1453,7 +1482,7 @@ class OntologyService:
         tables: dict[str, dict[str, Any]] = {}
         for r in results:
             ref = None
-            if r["state"] == "covered" and r["matches"]:
+            if r["state"] in ("covered", "covered_via_glossary") and r["matches"]:
                 top = r["matches"][0]
                 ref = top["name"] if top["kind"] == "term" else top.get("term")
             elif r["state"] == "covered_by_value" and r.get("value_matches"):
