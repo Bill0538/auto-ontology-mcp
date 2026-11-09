@@ -68,6 +68,7 @@ class Validator:
         for a in attributes:
             self.attr_by_column.setdefault(a["column_id"], []).append(a)
         self.sql_attributes = sql_attributes
+        self.table_name_by_id = {c["table_id"]: c["table_name"] for c in catalog_columns if c.get("table_id")}
         self.run = run
 
     # ---------------------------------------------------------------- helpers
@@ -505,6 +506,7 @@ class Validator:
                 if a["display_name"] not in t["attributes"]:
                     t["attributes"].append(a["display_name"])
         normalized = " ".join(sql.split()).casefold()
+        read = {(p.table.casefold(), p.column.casefold()) for p in analysis.columns}
         used_sql_attrs = []
         for s in self.sql_attributes:
             expr = " ".join((s["expression"] or "").split()).casefold()
@@ -512,7 +514,10 @@ class Validator:
                 used_sql_attrs.append({"term": s["term_name"], "name": s["name"], "status": s["status"]})
             elif s["kind"] in ("measure", "filter", "dimension") and expr:
                 bare = _strip_qualifiers(s["expression"], self.dialect)
-                if bare and bare in _strip_qualifiers(sql, self.dialect, whole=True):
+                # The same text with aliases instead of table names only counts when the query reads the
+                # attribute's own columns: COUNT(DISTINCT a.user_id) over another table is not this measure.
+                columns = self._attribute_columns(s)
+                if bare and columns and columns <= read and bare in _strip_qualifiers(sql, self.dialect, whole=True):
                     used_sql_attrs.append({"term": s["term_name"], "name": s["name"], "status": s["status"]})
         return {
             "terms": list(terms.values()),
@@ -520,6 +525,22 @@ class Validator:
             "sql_attributes": used_sql_attrs,
             "unmodeled_columns": sorted(set(unmodeled)),
         }
+
+
+    def _attribute_columns(self, s: dict[str, Any]) -> set[tuple[str, str]]:
+        """(table, column) pairs a measure, filter or dimension reads; unqualified columns belong to its Term's table."""
+        try:
+            tree = sqlglot.parse_one(f"SELECT {s['expression']}", read=self.dialect)
+        except Exception:  # noqa: BLE001
+            return set()
+        own = self.table_name_by_id.get(s.get("primary_table_id"))
+        out = set()
+        for col in tree.find_all(exp.Column):
+            table = col.table or own
+            if not table:
+                return set()
+            out.add((table.casefold(), col.name.casefold()))
+        return out
 
 
 def _strip_qualifiers(sql: str, dialect: str | None, whole: bool = False) -> str:

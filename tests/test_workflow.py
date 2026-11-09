@@ -283,6 +283,18 @@ def test_sql_attributes_validate_and_certify(modeled):
     assert changed["sql_attribute"]["status"] == "draft"
 
 
+def test_grounding_names_a_sql_attribute_only_when_its_columns_are_read(modeled):
+    modeled.save_sql_attribute("Product", "Average List Price", "AVG(products.unit_price)", kind="measure")
+
+    def used(sql):
+        return [a["name"] for a in modeled.validate_sql(sql)["grounding"]["sql_attributes"]]
+
+    # Same text with an alias: the measure is used.
+    assert "Average List Price" in used("SELECT AVG(p.unit_price) FROM products p")
+    # Same text without table names, but over order lines: a different column, not this measure.
+    assert "Average List Price" not in used("SELECT AVG(l.unit_price) FROM order_lines l")
+
+
 def test_search_and_answerability_after_saving_sql_attributes(modeled):
     modeled.save_sql_attribute("Order", "Delivered Orders", "orders.status = 'Delivered'", "Orders that reached the customer.", kind="filter")
     hits = modeled.search_ontology("delivered orders")["hits"]
