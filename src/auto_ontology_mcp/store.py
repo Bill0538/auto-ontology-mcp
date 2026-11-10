@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS catalog_column (
     max_value TEXT,
     format TEXT,
     value_set_complete INTEGER NOT NULL DEFAULT 0,
+    list_separator TEXT,
     UNIQUE (table_id, name)
 );
 
@@ -205,6 +206,9 @@ JSON_FIELDS = {"schemas", "pk", "sample_values", "evidence", "synonyms", "valida
 
 # Columns added after the first release; ALTER TABLE brings older stores up to date.
 _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
+    "catalog_column": [
+        ("list_separator", "TEXT"),
+    ],
     "term": [
         ("kind", "TEXT NOT NULL DEFAULT 'entity'"),
         ("body", "TEXT"),
@@ -426,7 +430,7 @@ class Store:
         return self.all(
             """
             SELECT a.*, c.name AS column_name, c.data_type, c.sample_values, c.is_unique,
-                   c.format, c.null_fraction, c.min_value, c.max_value,
+                   c.format, c.null_fraction, c.min_value, c.max_value, c.value_set_complete, c.list_separator,
                    t.id AS table_id, t.name AS table_name, t.schema_name AS schema_name
             FROM column_attribute a
             JOIN catalog_column c ON c.id = a.column_id
@@ -441,7 +445,7 @@ class Store:
             """
             SELECT a.*, tm.name AS term_name, tm.status AS term_status,
                    c.name AS column_name, c.data_type, c.table_id, c.sample_values,
-                   c.format, c.value_set_complete, c.is_unique,
+                   c.format, c.value_set_complete, c.is_unique, c.list_separator,
                    t.name AS table_name, t.schema_name AS schema_name
             FROM column_attribute a
             JOIN term tm ON tm.id = a.term_id

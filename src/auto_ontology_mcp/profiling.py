@@ -101,6 +101,31 @@ def infer_date_format(values: Iterable[Any]) -> str | None:
     return first
 
 
+_LIST_SEPARATORS = (",", ";", "|")
+
+
+def infer_list_separator(values: list[Any]) -> str | None:
+    """The separator of a text column that stores lists ('SLE, SjS'), or None.
+
+    A column counts as a list column when at least two distinct values contain the
+    separator and most of the items those values split into also occur on their own
+    ('SLE' and 'SjS' are values too). Free text that happens to contain commas
+    (addresses, names) fails the second test, because its pieces never stand alone.
+    """
+    strings = {v.strip() for v in values if isinstance(v, str) and v.strip()}
+    if len(strings) < 3:
+        return None
+    standalone = {s.casefold() for s in strings}
+    for sep in _LIST_SEPARATORS:
+        multi = [s for s in strings if sep in s]
+        if len(multi) < 2:
+            continue
+        items = [i.strip().casefold() for s in multi for i in s.split(sep) if i.strip()]
+        if items and sum(1 for i in items if i in standalone) / len(items) >= 0.6:
+            return sep
+    return None
+
+
 def _json_ready(value: Any) -> Any:
     from .datasources import json_value
 
@@ -153,8 +178,16 @@ def profile_rows(
             if fmt and not minimum and all(isinstance(v, str) for v in values):
                 minimum, maximum = min(values), max(values)
 
+        list_sep = infer_list_separator(values) if is_text_type(declared) and fmt is None else None
+        if list_sep:
+            # Show a list-shaped value among the samples so the model sees the shape.
+            example = next((first_by_key[k] for k, _ in counter.most_common() if list_sep in str(first_by_key[k])), None)
+            if example is not None and example not in samples and len(str(example)) <= MAX_SAMPLE_LEN:
+                samples = samples[: TOP_N - 1] + [example]
+
         out[name] = {
             "sample_values": samples,
+            "list_separator": list_sep,
             "is_unique": is_unique,
             "null_fraction": round((total - len(values)) / total, 4) if total else None,
             "distinct_in_sample": len(counter),

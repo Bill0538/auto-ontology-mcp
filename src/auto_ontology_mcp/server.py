@@ -118,18 +118,41 @@ def _tool_errors(fn: Callable[..., Any]) -> Callable[..., Any]:
     return wrapper
 
 
+# Which group each tool belongs to (AUTO_ONTOLOGY_TOOLSETS). 'answer' is always on.
+TOOL_GROUPS: dict[str, str] = {
+    **dict.fromkeys(
+        ["check_readiness", "search_ontology", "get_term", "describe_table", "find_join_path", "check_answerable",
+         "get_query_context", "lookup_values", "validate_sql", "run_sql", "save_example_query", "search", "fetch"],
+        "answer",
+    ),
+    **dict.fromkeys(
+        ["add_datasource", "scan_datasource", "get_modeling_worklist", "save_table_terms", "list_relationships",
+         "set_relationship", "suggest_sql_attributes", "save_sql_attribute", "update_term", "save_glossary"],
+        "model",
+    ),
+    **dict.fromkeys(
+        ["define_entity", "add_records", "edit_records", "save_concept", "save_passages", "search_text", "get_source",
+         "list_terms", "recent_changes", "export_wiki"],
+        "knowledge",
+    ),
+    **dict.fromkeys(["export_ontology", "import_ontology"], "share"),
+}
+
+
 def build_server(settings: Settings | None = None, service: OntologyService | None = None) -> FastMCP:
     settings = settings or Settings.from_env()
     svc = service or OntologyService(settings)
     mcp = FastMCP(
         name="auto-ontology",
-        instructions=guidance.SERVER_INSTRUCTIONS,
+        instructions=guidance.server_instructions(settings.toolsets),
         version=__version__,
         website_url="https://github.com/gogoymh/auto-ontology-mcp",
     )
 
     def tool(annotations: ToolAnnotations, **kw: Any) -> Callable[[Callable[..., Any]], Any]:
         def deco(fn: Callable[..., Any]) -> Any:
+            if TOOL_GROUPS[fn.__name__] not in settings.toolsets:
+                return fn  # not exposed; the function stays importable for tests
             return mcp.tool(annotations=annotations, **kw)(_tool_errors(fn))
 
         return deco

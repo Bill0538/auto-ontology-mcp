@@ -9,13 +9,15 @@ NVIDIA Auto Ontology (Apache-2.0): ``semantic/term_extractor.py``,
 and ``skills/nvidia-ontology-query/references/query-validation.md``.
 """
 
-SERVER_INSTRUCTIONS = """\
+_INTRO = """\
 Auto Ontology MCP gives you (the model) a semantic layer over relational databases: \
 business Terms mapped to columns, reviewed SQL attributes (measures, filters, joins) and \
 verified relationships between tables. The server does the deterministic work (schema \
 extraction, profiling, key inference, validation, read-only execution). You do the \
 language work that NVIDIA Auto Ontology normally sends to its own LLM.
 
+"""
+_ANSWERING = """\
 Answering a data question (always in this order):
 1. check_readiness: is there a modeled datasource that can execute SQL?
 2. check_answerable(question, entities): extract the entity phrases yourself, see which \
@@ -30,6 +32,8 @@ unverified joins, percent-vs-fraction).
 show the SQL, and mention truncation and any uncertified (draft) Terms you relied on.
 8. If the user confirms the answer is right, save_example_query so the next answer reuses it.
 
+"""
+_BUILDING = """\
 Building an ontology: add_datasource → scan_datasource → get_modeling_worklist / \
 save_table_terms until no tables remain → list_relationships / set_relationship to review \
 proposed joins → suggest_sql_attributes / save_sql_attribute → certify what a person approved \
@@ -37,6 +41,8 @@ with update_term(status="certified"). After a schema change, scan_datasource aga
 reviewed joins are kept, and get_modeling_worklist returns new tables and modeled tables that \
 gained columns (send their current_terms back with the new columns placed).
 
+"""
+_KNOWLEDGE = """\
 Keeping personal knowledge (datasource "knowledge", created on first use): when the user shares \
 documents, images, notes or facts to remember, read them yourself and store what they contain. \
 search_ontology first and reuse existing Terms instead of creating near-duplicates. Facts you \
@@ -60,10 +66,28 @@ give the [[link]] to the original. When an answer is worth keeping, file it back
 concept's body or save_example_query. export_wiki writes the store as Obsidian pages next to the \
 originals.
 
+"""
+_SEARCH = """\
 Search is lexical, not semantic. Search with the words the schema uses; if the user writes in \
 another language, translate entity phrases to the ontology's language first, and try synonyms. \
 Add the user's own words as Term synonyms with update_term so the next search finds them.
 """
+
+
+def server_instructions(toolsets: frozenset[str] | set[str] | None = None) -> str:
+    """The handshake instructions, without the parts for tool groups the server does not expose."""
+    on = toolsets or TOOLSETS
+    parts = [_INTRO, _ANSWERING]
+    if "model" in on:
+        parts.append(_BUILDING)
+    if "knowledge" in on:
+        parts.append(_KNOWLEDGE)
+    parts.append(_SEARCH)
+    return "".join(parts)
+
+
+TOOLSETS = frozenset({"answer", "model", "knowledge", "share"})
+SERVER_INSTRUCTIONS = server_instructions(TOOLSETS)
 
 TERM_RULES = """\
 Propose business Terms for each table and assign its candidate columns (ported from Auto \
@@ -121,6 +145,8 @@ IS NULL on a meaningful column (deleted_at IS NULL) is valid.
 4. Promote a JOIN condition or UNION when it appears often AND encodes business logic, defines \
 a named alias, or unions several join paths into one population (Task Participants).
 5. For a bridge table, one SQL attribute that joins through it to all related entities.
+6. Use only literals whose meaning the documentation or the data make clear. A code you cannot explain (one the \
+docs do not list) stays out of the expression; mention it in the description instead of guessing.
 For each one give: name (Title Case, spaces), description (what it captures and when to use \
 it), expression (exact SQL), kind (measure | filter | dimension | join | query).
 Fragments (measure, filter, dimension) reference columns of the Term's own table, qualified by \
@@ -146,7 +172,9 @@ SQL_RULES = """\
 Writing the SQL (ported from Auto Ontology's text-to-SQL rules):
 - Use only tables and columns from the context. Qualify columns with table aliases.
 - Follow the join path hop by hop; never shortcut a multi-hop path by joining its endpoints.
-- When a SQL attribute matches the intent, reuse its expression rather than re-deriving it.
+- When a certified SQL attribute matches the intent, reuse its expression rather than re-deriving it. A draft \
+one is a modeler's suggestion: compare its literals and description with the question's own wording first, and \
+leave out anything the question did not ask for.
 - When a verified example query matches, start from it.
 - Both sides of a join must have the same type; never match a name or label against an id \
 column; join each foreign key to the key it actually references.
@@ -157,6 +185,8 @@ also aggregate (fan-out). A ratio of totals is not a mean of ratios.
 are related only through it: count or sum each in its own subquery, then join the results on the \
 parent. Such a path does not tell which row of one belongs to which row of the other.
 - Respect value formats shown in the context (date strings, fractions vs percents, codes).
+- A column marked holds_lists stores several items in one value ('vegan, nut-free'). Match one item \
+(instr(',' || replace(col, ' ', '') || ',', ',vegan,') > 0), not the whole value with =.
 - A filter on a single constant value does not need that column in SELECT.
 """
 

@@ -22,6 +22,19 @@ def _int(name: str, default: int) -> int:
         return default
 
 
+TOOLSETS = ("answer", "model", "knowledge", "share")
+
+
+def _toolsets(raw: str | None) -> frozenset[str]:
+    if not raw or raw.strip().lower() == "all":
+        return frozenset(TOOLSETS)
+    chosen = {x.strip().lower() for x in raw.split(",") if x.strip()}
+    unknown = chosen - set(TOOLSETS)
+    if unknown:
+        raise ValueError(f"AUTO_ONTOLOGY_TOOLSETS: unknown toolset(s) {sorted(unknown)}; choose from {', '.join(TOOLSETS)} or all.")
+    return frozenset(chosen | {"answer"})
+
+
 @dataclass(frozen=True)
 class Settings:
     home: Path
@@ -51,6 +64,10 @@ class Settings:
     vault: Path | None = None
     """Obsidian vault for originals (AUTO_ONTOLOGY_VAULT). Unset: the knowledge export folder is the vault."""
 
+    toolsets: frozenset[str] = frozenset({"answer", "model", "knowledge", "share"})
+    """Tool groups to expose (AUTO_ONTOLOGY_TOOLSETS, comma-separated; default all). A client that only
+    asks questions of modeled databases needs 'answer'; fewer tools leave the model more context."""
+
     @classmethod
     def from_env(cls) -> "Settings":
         home = Path(os.environ.get("AUTO_ONTOLOGY_HOME", "~/.auto-ontology-mcp")).expanduser()
@@ -66,4 +83,5 @@ class Settings:
             host=os.environ.get("AUTO_ONTOLOGY_MCP_HOST", "127.0.0.1"),
             port=_int("AUTO_ONTOLOGY_MCP_PORT", 8765),
             vault=Path(os.environ["AUTO_ONTOLOGY_VAULT"]).expanduser() if os.environ.get("AUTO_ONTOLOGY_VAULT") else None,
+            toolsets=_toolsets(os.environ.get("AUTO_ONTOLOGY_TOOLSETS")),
         )

@@ -136,6 +136,7 @@ class Validator:
         fanned = self._check_joins(analysis, errors, warnings, notes, probe)
         self._check_fanout(analysis, fanned, warnings)
         self._check_branch_fanout(analysis, fanned, warnings)
+        self._check_list_columns(analysis, warnings)
         if probe:
             self._check_string_literals(analysis, warnings)
             self._check_numeric_scale(analysis, warnings)
@@ -403,6 +404,23 @@ class Validator:
                     self._check_like(col, value, f["op"], warnings)
                 elif f["op"] in ("EQ", "IN"):
                     self._check_equals(col, value, warnings)
+
+    def _check_list_columns(self, analysis: Analysis, warnings: list[str]) -> None:
+        """= or IN against a column whose values are lists ('vegan, nut-free') only matches whole lists."""
+        seen: set[str] = set()
+        for f in analysis.string_filters:
+            col = self._col(f["column"])
+            if not col or not col.get("list_separator") or f["op"] not in ("EQ", "IN") or col["id"] in seen:
+                continue
+            seen.add(col["id"])
+            sep = col["list_separator"]
+            name = f"{col['table_name']}.{col['name']}"
+            item = (f["values"] or ["item"])[0]
+            warnings.append(
+                f"{name} holds '{sep}'-separated lists, so {name} = '{item}' only matches rows whose whole list is "
+                f"'{item}'. To match the item inside lists, use instr('{sep}' || replace({col['name']}, ' ', '') || "
+                f"'{sep}', '{sep}{item.replace(' ', '')}{sep}') > 0."
+            )
 
     def _check_equals(self, col: dict[str, Any], value: str, warnings: list[str]) -> None:
         where = exp.EQ(this=qcol(col["name"]), expression=literal(value))

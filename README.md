@@ -190,12 +190,12 @@ Remove everything the demo added to the knowledge store and the vault with `auto
 
 | | |
 | --- | --- |
-| **Catalog and profiling** | Reads tables, columns, declared keys and comments through SQLAlchemy, then samples rows to record top values, uniqueness, null rates, ranges, date formats and the complete value set of small text enums |
+| **Catalog and profiling** | Reads tables, columns, declared keys and comments through SQLAlchemy, then samples rows to record top values, uniqueness, null rates, ranges, date formats, the complete value set of small text enums, and text columns that store lists (`'SLE, RA'`) |
 | **Key inference** | Finds undeclared primary and foreign keys by name and confirms them by value containment. Detects roles (`billing_` vs `delivery_`), self references and bridge tables, and lists identifier columns it could not place |
 | **Modeling with your model** | Hands the model one table at a time with samples, keys and the modeling rules from Auto Ontology, then validates and stores the Terms and column mappings it proposes |
 | **SQL attributes** | Mines reusable filters, measures and join patterns from executed and verified queries and bridge tables, runs each candidate against the database before saving it |
 | **Answerability** | Matches the question's entities to Terms, attributes and SQL attributes, and to names stored in the data (products, places, statuses). As in Auto Ontology, the glossary interprets a phrase rather than covering it: a phrase that matches a glossary entry is covered when the entry's definition names or matches part of the model. It then checks how the matched tables link: row to row, only at a table the question also names (counted per that table), only at a shared parent it does not name, or not at all. Join paths prefer a route that ties rows to rows over a shorter one that only meets at a shared parent |
-| **Validation** | Unknown columns (with the ontology's name for them), joins the ontology does not know (a join saved as a join SQL attribute counts as known), near-miss literals (in `WHERE`, `HAVING` and comparisons in the select list such as `SUM(status = 'shipped')`), percent-vs-fraction thresholds, one-to-many fan-out, and a dry run. Fan-out is judged on what is aggregated: `SUM(products.unit_price)` over order lines is flagged, while `SUM(order_lines.quantity * products.unit_cost)` or a `CASE WHEN orders.… THEN order_lines.line_total END` is not, because the value is computed per order line. Two branches that hang one-to-many from the same table (order lines and product tags of a product) are flagged when aggregated together, unless the query groups by the other branch (revenue by tag) |
+| **Validation** | Unknown columns (with the ontology's name for them), joins the ontology does not know (a join saved as a join SQL attribute counts as known), near-miss literals (in `WHERE`, `HAVING` and comparisons in the select list such as `SUM(status = 'shipped')`), `=` against a column that stores lists, percent-vs-fraction thresholds, one-to-many fan-out, and a dry run. Fan-out is judged on what is aggregated: `SUM(products.unit_price)` over order lines is flagged, while `SUM(order_lines.quantity * products.unit_cost)` or a `CASE WHEN orders.… THEN order_lines.line_total END` is not, because the value is computed per order line. Two branches that hang one-to-many from the same table (order lines and product tags of a product) are flagged when aggregated together, unless the query groups by the other branch (revenue by tag) |
 | **Governance** | Draft, certified and deprecated status on Terms and SQL attributes; editing a certified definition returns it to draft. Verified question and SQL pairs feed later answers |
 | **Knowledge store** | A writable store for what your assistant reads: entities with typed columns and references, concepts with a markdown body and typed relations, passages (excerpts and section summaries), and a source with locator and quote behind every record. An index, a change log and an Obsidian export make it usable as an LLM Wiki |
 | **Full-text search** | FTS5 indexes over passages, Term bodies and sources, ranked with bm25. Prefix matching finds words with Korean particles attached (기억 → 기억을), and a substring pass finds them inside compounds. `search_text` returns snippets, headings and `[[links]]` to the originals |
@@ -552,6 +552,8 @@ Prompts: `build_ontology`, `answer_question`, `remember`, `review_ontology`. Res
 
 Read tools carry `readOnlyHint`, and tools that can delete carry `destructiveHint`, so clients can skip or require confirmation accordingly.
 
+A client that only asks questions of databases someone has already modeled can set `AUTO_ONTOLOGY_TOOLSETS=answer`: the server then exposes the 13 tools in the Status, Explore and Answer rows plus `find_join_path`, `search` and `fetch` and leaves the modeling and knowledge-store steps out of its handshake instructions. That cuts the tool definitions the client sends with every request from about 52,000 characters to about 12,000. Add `model`, `knowledge` or `share` to the list to expose those groups as well.
+
 ## How it works
 
 ```mermaid
@@ -613,6 +615,7 @@ Over HTTP, a token is required to reach the server from anywhere but localhost: 
 | `AUTO_ONTOLOGY_QUERY_TIMEOUT_S` | `30` | Per-query timeout in seconds |
 | `AUTO_ONTOLOGY_PROFILE_ROWS` | `1000` | Rows sampled per table while profiling |
 | `AUTO_ONTOLOGY_ALLOW_DATASOURCE_TOOLS` | `1` | `0` hides `add_datasource` and `scan_datasource` from MCP |
+| `AUTO_ONTOLOGY_TOOLSETS` | `all` | Tool groups to expose, comma-separated: `answer` (always on), `model`, `knowledge`, `share` |
 | `AUTO_ONTOLOGY_MCP_TOKEN` | unset | Token required by the HTTP transport (same as `--token`) |
 | `AUTO_ONTOLOGY_MCP_HOST` / `_PORT` | `127.0.0.1` / `8765` | HTTP bind address |
 </details>

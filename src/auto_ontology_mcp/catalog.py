@@ -303,6 +303,7 @@ class Scanner:
                         "max_value": s["max_value"],
                         "format": s["format"],
                         "value_set_complete": complete,
+                        "list_separator": s.get("list_separator"),
                     },
                     con,
                 )

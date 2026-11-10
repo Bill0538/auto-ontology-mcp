@@ -30,6 +30,8 @@ from .validation import Validator, qtable
 
 TERM_STATUSES = ("draft", "certified", "deprecated")
 SQL_ATTR_KINDS = ("measure", "filter", "dimension", "join", "query")
+SAMPLES_SHOWN = 3  # sample values per column in Term and table views (complete value sets are shown in full)
+SAMPLE_CHARS = 40
 _MEASURE_WORDS = {"amount", "price", "cost", "total", "revenue", "sales", "qty", "quantity", "profit", "margin", "value", "spend", "fee", "tax", "balance", "salary", "income", "discount"}
 
 
@@ -315,18 +317,31 @@ class OntologyService:
 
     @staticmethod
     def _column_view(c: dict[str, Any]) -> dict[str, Any]:
+        """One column as the model sees it. Only what helps write SQL: a complete value set in full,
+        a few short samples otherwise, and flags only when they are set."""
         out: dict[str, Any] = {"column": c["name"], "type": c.get("data_type")}
         if c.get("description"):
             out["description"] = c["description"]
-        if c.get("sample_values"):
-            out["all_values" if c.get("value_set_complete") else "sample_values"] = c["sample_values"]
-        if c.get("is_unique") is not None:
-            out["unique_in_sample"] = bool(c["is_unique"])
-        if c.get("null_fraction"):
-            out["null_fraction"] = c["null_fraction"]
+        samples = c.get("sample_values")
+        if samples:
+            if c.get("value_set_complete"):
+                out["all_values"] = samples
+            else:
+                out["sample_values"] = [
+                    v[:SAMPLE_CHARS] + "…" if isinstance(v, str) and len(v) > SAMPLE_CHARS else v for v in samples[:SAMPLES_SHOWN]
+                ]
+        if c.get("list_separator"):
+            out["holds_lists"] = (
+                f"Values are '{c['list_separator']}'-separated lists; match one item, not the whole value."
+            )
+        if c.get("is_unique"):
+            out["unique_in_sample"] = True
+        null_fraction = round(c.get("null_fraction") or 0, 2)
+        if null_fraction:
+            out["null_fraction"] = null_fraction
         if c.get("format"):
             out["format"] = c["format"]
-        if c.get("min_value") is not None and c.get("max_value") is not None:
+        if c.get("min_value") is not None and c.get("max_value") is not None and not c.get("value_set_complete"):
             out["range_in_sample"] = [c["min_value"], c["max_value"]]
         return out
 
@@ -1619,6 +1634,12 @@ class OntologyService:
             seen_ids.add(t["id"])
             view = self.get_term(t["id"], datasource=ds["name"])
             view.pop("related_terms", None)
+            view.pop("id", None)
+            for key in ("note", "certified_at", "synonyms", "relations", "sql_attributes", "sources"):
+                if not view.get(key):
+                    view.pop(key, None)
+            if view.get("kind") == "entity":
+                view.pop("kind")
             if t.get("primary_table_id"):
                 tbl = self.store.table(t["primary_table_id"])
                 view["qualified_table"] = self._qualified(ds, tbl)
@@ -1651,7 +1672,7 @@ class OntologyService:
                 if len(examples) >= 3:
                     break
         glossary = self.store.glossary(ds["id"])
-        return {
+        out: dict[str, Any] = {
             "datasource": ds["name"],
             "dialect": dialect or ds.get("dialect"),
             "terms": term_views,
@@ -1666,8 +1687,15 @@ class OntologyService:
             "glossary": [{"name": x["name"], "definition": x["definition"]} for x in glossary[:30]],
             "unresolved": unresolved,
             "sql_rules": guidance.SQL_RULES,
+            "answer_checklist": guidance.ANSWER_CHECKLIST,
             "next_step": "Write the SQL, check literals with lookup_values if unsure, then validate_sql and run_sql.",
         }
+        same = _attributes_in_several_tables(term_views)
+        if same:
+            out["same_attribute_in_several_tables"] = same
+        for view in term_views:  # one line per column: the same facts as get_term, a third shorter
+            view["columns"] = [_column_line(a) for a in view.pop("attributes", [])]
+        return out
 
     def lookup_values(self, column: str, contains: str | None = None, limit: int = 20, datasource: str | None = None) -> dict[str, Any]:
         ds = self.ds(datasource)
@@ -1764,7 +1792,6 @@ class OntologyService:
             "warnings": warnings,
             "notes": static["notes"],
             "grounding": static["grounding"],
-            "answer_checklist": guidance.ANSWER_CHECKLIST,
         }
         if result.truncated:
             out["notes"].append(f"Only the first {cap} rows are shown; do not present them as a complete list or total.")
@@ -1994,6 +2021,68 @@ def _num(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _sql_value(v: Any) -> str:
+    return "'" + v.replace("'", "''") + "'" if isinstance(v, str) else json.dumps(v, default=str)
+
+
+def _column_line(a: dict[str, Any]) -> str:
+    """`column [Label] TYPE, flags: description. Values: ...` for one attribute view from _column_view."""
+    head = a["column"]
+    if a.get("name") and a["name"].casefold() != a["column"].casefold():
+        head += f" [{a['name']}]"
+    flags = [a.get("type") or "?"]
+    if a.get("unique_in_sample"):
+        flags.append("unique")
+    if a.get("null_fraction"):
+        flags.append(f"{round(a['null_fraction'] * 100)}% null")
+    if a.get("format"):
+        flags.append(f"format {a['format']}")
+    line = f"{head} ({', '.join(flags)})"
+    if a.get("description"):
+        line += f": {a['description'].rstrip('.')}."
+    if a.get("all_values"):
+        line += " All values: " + ", ".join(_sql_value(v) for v in a["all_values"]) + "."
+    elif a.get("sample_values"):
+        line += " e.g. " + ", ".join(_sql_value(v) for v in a["sample_values"]) + "."
+    if a.get("range_in_sample"):
+        line += f" Range {a['range_in_sample'][0]} to {a['range_in_sample'][1]}."
+    if a.get("holds_lists"):
+        line += " " + a["holds_lists"]
+    return line
+
+
+def _attributes_in_several_tables(term_views: list[dict[str, Any]]) -> list[str]:
+    """Notes for attributes whose name appears on more than one table in the context.
+
+    Wide schemas often copy a field into several tables (a school's charter funding type in the
+    school directory and in the meal-program file). The copies can disagree, so the model should
+    take the one from the table the question is about rather than whichever it saw first.
+    """
+    cols = []
+    for v in term_views:
+        table = v.get("table")
+        for a in v.get("attributes") or []:
+            if isinstance(a, dict) and table:
+                values = {x.casefold() for x in (a.get("all_values") or a.get("sample_values") or []) if isinstance(x, str) and len(x) >= 3}
+                cols.append((table, f"{table}.{a['column']}", a["name"].casefold(), values, bool(a.get("all_values"))))
+    notes = []
+    for i, a in enumerate(cols):
+        for b in cols[i + 1:]:
+            if a[0] == b[0]:
+                continue
+            shared = a[3] & b[3]
+            # The same label alone is not enough ("Name" on products and on customers): the values must overlap.
+            same_label = a[2] == b[2] and shared
+            # Two small code lists that mostly hold the same values are the same field under different names.
+            same_codes = a[4] and b[4] and len(shared) >= 2 and len(shared) >= 0.5 * min(len(a[3]), len(b[3]))
+            if same_label or same_codes:
+                notes.append(
+                    f"{a[1]} and {b[1]} hold the same field in different tables and may disagree; "
+                    "use the one from the table (or records) the question names."
+                )
+    return notes[:8]
 
 
 def _sql_attr_view(s: dict[str, Any]) -> dict[str, Any]:
